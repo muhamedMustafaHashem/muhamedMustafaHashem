@@ -1,11 +1,11 @@
 /* Service worker: app shell cached on install; question data and OCR assets cached on first use.
  * data/manifest.json is served from cache and refreshed in the background; data/<n>.json?v=<version>
  * files are immutable per version (cache first). Bump CACHE when shipping a new app version. */
-const CACHE = 'answer-app-v2';
+const CACHE = 'answer-app-v3';
 const SHELL = [
-  './', 'index.html', 'style.css', 'app.js', 'matcher.js', 'config.js', 'manifest.json',
+  './', 'index.html', 'style.css', 'app.js', 'matcher.js', 'importer.js', 'store.js', 'config.js', 'manifest.json',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png',
-  'vendor/tesseract/tesseract.min.js',
+  'vendor/tesseract/tesseract.min.js', 'vendor/read-excel-file.min.js',
 ];
 
 self.addEventListener('install', (e) => {

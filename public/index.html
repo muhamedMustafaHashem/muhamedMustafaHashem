@@ -22,11 +22,25 @@
   </header>
 
   <main id="view-home" class="view">
+    <section class="card empty" id="empty-card" hidden>
+      <h2>ابدأ برفع ملفات الأسئلة</h2>
+      <p>ارفع ملف Excel لكل مادة. يجب أن يحتوي على عمودين: <b>السؤال</b> و<b>الإجابة</b>، واسم الملف هو اسم المادة.</p>
+      <button id="btn-upload-empty" class="primary">＋ رفع ملفات Excel</button>
+      <p class="small">الصيغ المدعومة: xlsx وcsv. الملفات تُحفظ على هاتفك فقط. للتحقق من الصورة يُرسل إلى الخادم الصورة ونص الأسئلة المرشحة فقط، ولا تُرسل الإجابات أبداً.</p>
+    </section>
+
     <section class="card" id="subject-card" hidden>
       <label class="mode-label" for="subject">المادة</label>
       <select id="subject" aria-label="المادة"><option value="" disabled>جارٍ التحميل…</option></select>
       <p id="subject-hint" class="hint"></p>
+      <div class="row-actions">
+        <button id="btn-upload" class="small-btn">＋ رفع ملفات Excel</button>
+        <button id="btn-manage" class="small-btn">إدارة المواد</button>
+      </div>
     </section>
+    <input id="xl-input" type="file" multiple hidden
+           accept=".xlsx,.xlsm,.csv,.xls,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet">
+
 
     <section class="card">
       <label class="mode-label">طريقة قراءة النص</label>
@@ -88,9 +102,32 @@
     <button id="btn-close-settings" class="primary">إغلاق</button>
   </dialog>
 
+  <dialog id="import-dialog">
+    <h2>رفع ملفات الأسئلة</h2>
+    <p class="small">كل ملف يصبح مادة باسم الملف. تحقق من الأعمدة والتحذيرات ثم احفظ.</p>
+    <div id="import-list"></div>
+    <p id="import-error" class="notice error" hidden></p>
+    <div class="dlg-actions">
+      <button id="import-save" class="primary" disabled>حفظ</button>
+      <button id="import-cancel" class="secondary">إلغاء</button>
+    </div>
+  </dialog>
+
+  <dialog id="manage-dialog">
+    <h2>إدارة المواد</h2>
+    <div id="manage-list"></div>
+    <div class="dlg-actions">
+      <button id="manage-add" class="primary">＋ رفع ملفات Excel</button>
+      <button id="manage-close" class="secondary">إغلاق</button>
+    </div>
+  </dialog>
+
   <script src="config.js"></script>
   <script src="matcher.js"></script>
+  <script src="importer.js"></script>
+  <script src="store.js"></script>
   <script src="vendor/tesseract/tesseract.min.js" defer></script>
+  <script src="vendor/read-excel-file.min.js" defer></script>
   <script src="app.js" defer></script>
 </body>
 </html>

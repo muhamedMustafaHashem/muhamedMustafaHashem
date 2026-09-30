@@ -24,24 +24,48 @@
   }
   document.querySelectorAll('#mode button').forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode)));
 
-  // ---------- dataset: one JSON per subject, only the selected subject is indexed ----------
-  let manifest = null;               // {version, subjects: [{number, name, count, file, version}]}
-  const subjectCache = new Map();    // number -> {number, name, items}
+  // ---------- subjects: uploaded by the user (kept on this phone) and, optionally, built into the app ----------
+  // Each subject is one Excel file. Only the selected subject is indexed for matching.
+  let manifest = { subjects: [] };   // [{number, name, count, version, source: 'user' | 'bundled', file?}]
+  let bundledVersion = '';
+  let storeOk = true;
+  const subjectCache = new Map();    // "number:version" -> {number, name, items}
   let index = null;                  // matcher index of the current selection
-  const subjectByNumber = (n) => manifest && manifest.subjects.find((s) => String(s.number) === String(n));
-  const multiSubject = () => !!manifest && manifest.subjects.length > 1;
+  const subjectByNumber = (n) => manifest.subjects.find((s) => String(s.number) === String(n));
+  const multiSubject = () => manifest.subjects.length > 1;
+  const cacheKey = (s) => `${s.number}:${s.version}`;
 
-  async function loadManifest() {
-    const res = await fetch('data/manifest.json', { cache: 'no-cache' });
-    if (!res.ok) throw new Error('manifest ' + res.status);
-    return res.json();
+  // Subjects built into the app by tools/build_data.py are optional: no data/manifest.json means none.
+  async function loadBundled() {
+    try {
+      const res = await fetch('data/manifest.json', { cache: 'no-cache' });
+      if (!res.ok) return [];
+      const m = await res.json();
+      bundledVersion = m.version || '';
+      return m.subjects.map((s) => ({ ...s, source: 'bundled' }));
+    } catch { return []; }
+  }
+  async function loadUploaded() {
+    try { const list = await Store.list(); storeOk = true; return list.map((s) => ({ ...s, source: 'user' })); }
+    catch (e) { console.warn('store', e); storeOk = false; return []; }
+  }
+  async function reloadLibrary() {
+    const [bundled, mine] = await Promise.all([loadBundled(), loadUploaded()]);
+    manifest = { subjects: [...bundled, ...mine] };
   }
   async function loadSubject(s) {
-    if (subjectCache.has(s.number)) return subjectCache.get(s.number);
-    const res = await fetch(`data/${s.file}?v=${s.version}`);
-    if (!res.ok) throw new Error(`${s.file} ${res.status}`);
-    const doc = await res.json();
-    subjectCache.set(s.number, doc);
+    const key = cacheKey(s);
+    if (subjectCache.has(key)) return subjectCache.get(key);
+    let doc;
+    if (s.source === 'user') {
+      doc = await Store.get(s.number);
+    } else {
+      const res = await fetch(`data/${s.file}?v=${s.version}`);
+      if (!res.ok) throw new Error(`${s.file} ${res.status}`);
+      doc = await res.json();
+    }
+    if (!doc) throw new Error('subject missing ' + s.number);
+    subjectCache.set(key, doc);
     return doc;
   }
   // Build the index for the current choice: one subject, or all subjects merged ("كل المواد").
@@ -52,7 +76,7 @@
     const items = docs.flatMap((d) => (all ? d.items.map((i) => ({ ...i, subject: d.name })) : d.items));
     index = M.buildIndex(items);
     window.__items = items; // used by tests/golden_run.js
-    $('#about').textContent = `${items.length} سؤال في ${docs.length} مادة، إصدار ${manifest.version}`;
+    $('#about').textContent = `${items.length} سؤال في ${docs.length} مادة${bundledVersion ? '، إصدار ' + bundledVersion : ''}`;
     return items.length;
   }
   function renderPicker() {
@@ -60,7 +84,20 @@
     sel.innerHTML = '<option value="" disabled>اختر المادة…</option>' +
       manifest.subjects.map((s) => `<option value="${s.number}">${esc(s.name)} (${s.count})</option>`).join('') +
       (manifest.subjects.length > 1 ? '<option value="all">كل المواد</option>' : '');
-    $('#subject-card').hidden = manifest.subjects.length < 2;
+  }
+  // After the list of subjects changed (first load, upload, rename, delete): show the right cards and
+  // keep the selection valid. The caller re-applies the selection.
+  function refreshLibraryUI() {
+    const n = manifest.subjects.length;
+    document.body.dataset.empty = n ? '' : '1';
+    $('#empty-card').hidden = n > 0;
+    $('#subject-card').hidden = n === 0;
+    renderPicker();
+    if (n === 1) settings.subject = String(manifest.subjects[0].number);
+    if (settings.subject === 'all' && n < 2) settings.subject = '';
+    if (settings.subject !== 'all' && !subjectByNumber(settings.subject)) settings.subject = '';
+    save();
+    syncPicker();
   }
   function syncPicker() {
     $('#subject').value = settings.subject || '';
@@ -76,22 +113,26 @@
   }
   $('#subject').addEventListener('change', (e) => setSubject(e.target.value));
   // Idle prefetch of the other subjects so switching works offline later.
-  function prefetchOthers() {
-    const go = () => manifest.subjects.forEach((s) => { if (!subjectCache.has(s.number)) loadSubject(s).catch(() => {}); });
+  function prefetchOthers() { // only built-in subjects come over the network; uploaded ones are already local
+    const go = () => manifest.subjects.forEach((s) => { if (s.source === 'bundled' && !subjectCache.has(cacheKey(s))) loadSubject(s).catch(() => {}); });
     (window.requestIdleCallback || ((f) => setTimeout(f, 1500)))(go);
   }
-  let ready = null; // resolves when the manifest and the current subject are loaded
+  let ready = null; // resolves when the subjects and the current selection are loaded
   async function bootData() {
-    manifest = await loadManifest();
-    renderPicker();
-    const want = new URLSearchParams(location.search).get('subject'); // deep link: ?subject=2 or ?subject=all
+    await reloadLibrary();
+    const want = new URLSearchParams(location.search).get('subject'); // deep link (built-in subjects): ?subject=2 or ?subject=all
     if (want && (want === 'all' || subjectByNumber(want))) settings.subject = want;
-    if (manifest.subjects.length === 1) settings.subject = String(manifest.subjects[0].number);
-    if (settings.subject !== 'all' && !subjectByNumber(settings.subject)) settings.subject = '';
-    save();
-    syncPicker();
+    refreshLibraryUI();
     if (settings.subject) { await applySelection(); setStatus(''); }
     prefetchOthers();
+  }
+  // Reload the list after a change, keep a valid selection and rebuild the index.
+  async function reloadAndReapply() {
+    await reloadLibrary();
+    refreshLibraryUI();
+    index = null; window.__items = [];
+    if (settings.subject) { try { await applySelection(); } catch (e) { console.warn(e); } }
+    runSearch();
   }
   async function ensureIndex() {
     try { await ready; } catch { setStatus('تعذر تحميل الأسئلة، تحقق من الاتصال'); return false; }
@@ -202,9 +243,11 @@
   // Subject label shown when several subjects are searched together, plus the other subjects
   // that contain the identical question and answer.
   function subjectTag(c) {
-    if (!c.subject) return '';
+    // diagnostic mode also shows the question's position in its subject (the "#seq" used in golden labels)
+    const seq = settings.debug ? `<span class="subj idtag">#${c.id % 100000}</span>` : '';
+    if (!c.subject) return seq;
     const also = c.also && c.also.length ? ` · أيضاً في: ${c.also.map(esc).join('، ')}` : '';
-    return `<span class="subj">${esc(c.subject)}${also}</span>`;
+    return `<span class="subj">${esc(c.subject)}${also}</span>${seq}`;
   }
   function renderConfident(best, via, debugText) {
     $('#result').innerHTML = `
@@ -385,7 +428,7 @@
         } else {
           chip('C', 'fail');
           finish(() => renderCandidates(m.list.slice(0, 3), debug, clash
-            ? 'هذا السؤال موجود في أكثر من مادة بإجابات مختلفة. اختر المادة الصحيحة من القائمة:'
+            ? 'هذا السؤال موجود أكثر من مرة بإجابات مختلفة (في مادتين أو أكثر، أو مكرر في ملفك). اختر الإجابة الصحيحة بنفسك:'
             : hit
               ? 'التحقق لم يؤكد التطابق. اضغط على السؤال المطابق لعرض إجابته، أو قص السؤال وأعد المحاولة.'
               : settings.subject !== 'all' && multiSubject()
@@ -517,7 +560,7 @@
     const clash = M.hasConflictingTwin(results[0], results);
     const sure = M.decide(results, C.thresholds).status === 'confident' && !clash;
     box.innerHTML = `<div class="search-head">${sure ? '<span class="badge ok">✓ مطابق</span>' : '<span class="badge neutral">نتائج مقترحة</span>'}
-      ${clash ? '<p class="src">هذا السؤال موجود في أكثر من مادة بإجابات مختلفة، تأكد من المادة.</p>' : ''}</div>` +
+      ${clash ? '<p class="src">هذا السؤال موجود أكثر من مرة بإجابات مختلفة، تأكد من الإجابة الصحيحة.</p>' : ''}</div>` +
       results.map((c, i) => searchCard(c, q, !clash && i === 0)).join('') + searchActions();
     bindCards();
   }
@@ -525,6 +568,207 @@
   $('#q-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); runSearch(true, true); e.target.blur(); } });
   $('#q-clear').addEventListener('click', () => { $('#q-input').value = ''; runSearch(true); $('#q-input').focus(); });
   $('#search-results').addEventListener('click', (e) => { if (e.target.closest('[data-act="search-all"]')) setSubject('all'); });
+
+  // ---------- uploading Excel files: parsed on the phone and kept there ----------
+  const XL_ERRORS = {
+    old_format: 'صيغة Excel القديمة (xls) غير مدعومة. افتح الملف في Excel واحفظه بصيغة xlsx ثم ارفعه.',
+    unsupported: 'نوع الملف غير مدعوم. ارفع ملف Excel (xlsx) أو csv.',
+    too_big: 'الملف كبير جداً (الحد 25 ميغابايت).',
+    corrupt: 'تعذرت قراءة الملف. تأكد أنه ملف Excel سليم وغير محمي بكلمة مرور.',
+    empty: 'الملف لا يحتوي على بيانات.',
+    no_reader: 'قارئ Excel لم يُحمَّل بعد. حدّث الصفحة وحاول مرة أخرى.',
+    too_many: 'عدد الأسئلة في هذه المادة كبير جداً.',
+  };
+  let jobs = [];               // one per chosen file
+  let pendingReplace = null;   // subject number chosen with "تحديث": the next single file replaces it
+  const trunc = (s, n) => (s.length > n ? s.slice(0, n) + '…' : s);
+
+  function openFilePicker(replaceNumber) { pendingReplace = replaceNumber || null; $('#xl-input').click(); }
+  $('#btn-upload').addEventListener('click', () => openFilePicker());
+  $('#btn-upload-empty').addEventListener('click', () => openFilePicker());
+  $('#manage-add').addEventListener('click', () => openFilePicker());
+  $('#xl-input').addEventListener('change', (e) => { const files = [...e.target.files]; e.target.value = ''; if (files.length) startImport(files); });
+
+  // Column choice of a sheet -> the mapping used to read it (null = sheet is skipped).
+  function applyMap(s) {
+    const ok = s.q != null && s.a != null && s.q !== s.a;
+    s.map = ok ? { headerRow: s.info.headerRow, q: s.q, a: s.a,
+      opts: Object.fromEntries(Object.entries(s.info.opts).filter(([, c]) => c !== s.q && c !== s.a)) } : null;
+  }
+  async function makeJob(file) {
+    const job = { file, name: file.name.replace(/\.[^.]+$/, ''), sheets: [], error: null, items: [], report: null, replace: null };
+    try {
+      if (!window.readXlsxFile && /\.xlsx?m?$/i.test(file.name)) throw new Importer.ImportError('no_reader');
+      const parsed = await Importer.readFile(file, window.readXlsxFile);
+      job.name = parsed.stem;
+      job.sheets = parsed.sheets.filter((s) => s.rows.length).map((s) => {
+        const info = Importer.analyzeSheet(s.rows);
+        const sheet = { name: s.name, rows: s.rows, info, q: info.q, a: info.a, map: null };
+        applyMap(sheet);
+        return sheet;
+      });
+      if (!job.sheets.length) throw new Importer.ImportError('empty');
+    } catch (e) {
+      console.warn('import', file.name, e);
+      job.error = XL_ERRORS[e.code] ? e.code : 'corrupt';
+    }
+    return job;
+  }
+  const sameName = (job) => manifest.subjects.find((s) => s.source === 'user' && s.name.trim().toLowerCase() === job.name.trim().toLowerCase()) || null;
+  function recompute(job) {
+    if (job.error) return;
+    const res = Importer.buildFromSheets(job.sheets.map((s) => ({ rows: s.rows, map: s.map })));
+    job.items = res.items;
+    job.report = res.report;
+    job.replace = sameName(job);
+  }
+  async function startImport(files) {
+    if (!(await Store.available())) { setStatus('التخزين غير متاح في هذا المتصفح (ربما الوضع الخاص). افتح التطبيق في نافذة عادية.'); return; }
+    const dlg = $('#import-dialog');
+    $('#import-error').hidden = true;
+    $('#import-list').innerHTML = '<p class="notice">جارٍ قراءة الملفات…</p>';
+    $('#import-save').disabled = true;
+    if (!dlg.open) dlg.showModal();
+    const forced = pendingReplace; pendingReplace = null;
+    jobs = [];
+    for (const f of files) jobs.push(await makeJob(f)); // one at a time: keeps memory low on phones
+    if (forced && jobs.length === 1) { const s = subjectByNumber(forced); if (s) jobs[0].name = s.name; }
+    jobs.forEach(recompute);
+    renderJobs();
+  }
+  const colOptions = (labels, selected) => '<option value="">— تجاهل —</option>' +
+    labels.map((l, i) => `<option value="${i}"${i === selected ? ' selected' : ''}>${esc(l)}</option>`).join('');
+  function replaceText(job) {
+    return job.replace ? `مادة بهذا الاسم موجودة (${job.replace.count} سؤال) وسيتم استبدالها.` : '';
+  }
+  function jobHtml(job, i) {
+    const head = `<div class="imp-head"><input class="imp-name" data-i="${i}" value="${esc(job.name)}" aria-label="اسم المادة">
+      <button class="imp-x" data-imp="remove" data-i="${i}" aria-label="إزالة الملف">✕</button></div>`;
+    if (job.error) return `<article class="imp bad" data-i="${i}">${head}<p class="notice error">${esc(XL_ERRORS[job.error])}</p></article>`;
+    const r = job.report;
+    const warn = [];
+    job.sheets.forEach((s) => {
+      if (s.q == null || s.a == null) warn.push(['warn', `ورقة «${s.name}»: اختر عمود السؤال وعمود الإجابة، وإلا ستُتجاهل.`]);
+      else if (s.info.status === 'guess') warn.push(['warn', `ورقة «${s.name}»: لم أجد عناوين الأعمدة، تحقق من الاختيار.`]);
+    });
+    if (r.empty) warn.push(['info', `تم تخطي ${r.empty} سؤال بلا إجابة.`]);
+    if (r.merged) warn.push(['info', `تم دمج ${r.merged} سؤال مكرر بنفس الإجابة.`]);
+    if (r.conflicts.length) warn.push(['warn', `${r.conflicts.length} سؤال مكرر بإجابتين مختلفتين: لن يُعرض أي منهما كإجابة مؤكدة. مثال: «${trunc(r.conflicts[0].q, 60)}»`]);
+    if (r.near.length) warn.push(['info', `${r.near.length} زوج أسئلة متشابهة جداً، راجعها إن أمكن.`]);
+    const needsCheck = job.sheets.some((s) => s.info.status !== 'ok' || s.q == null || s.a == null);
+    const sheets = job.sheets.map((s, si) => `<div class="imp-sheet"><span class="sname">ورقة «${esc(s.name)}» · ${s.rows.length} صف</span>
+        <label>السؤال <select data-imp="q" data-i="${i}" data-s="${si}">${colOptions(s.info.labels, s.q)}</select></label>
+        <label>الإجابة <select data-imp="a" data-i="${i}" data-s="${si}">${colOptions(s.info.labels, s.a)}</select></label></div>`).join('');
+    const sample = job.items.slice(0, 3).map((it) => `<p><b>س:</b> ${esc(trunc(it.q, 70))}<br><b>ج:</b> ${esc(trunc(it.a, 70))}</p>`).join('');
+    return `<article class="imp${job.items.length ? '' : ' bad'}" data-i="${i}">${head}
+      <p class="imp-count">${job.items.length ? `✓ ${job.items.length} سؤال` : 'لا توجد أسئلة صالحة، لن يُحفظ هذا الملف.'}</p>
+      <p class="imp-replace">${esc(replaceText(job))}</p>
+      ${warn.map(([k, t]) => `<p class="imp-note ${k}">${k === 'warn' ? '⚠︎ ' : ''}${esc(t)}</p>`).join('')}
+      <details class="imp-cols"${needsCheck ? ' open' : ''}><summary>الأعمدة المستخدمة</summary>${sheets}</details>
+      ${sample ? `<div class="imp-sample"><span class="small">أمثلة مما قرأته:</span>${sample}</div>` : ''}
+    </article>`;
+  }
+  function renderJobs() {
+    $('#import-list').innerHTML = jobs.length ? jobs.map(jobHtml).join('') : '<p class="notice">لا توجد ملفات.</p>';
+    updateSaveButton();
+  }
+  const savable = () => jobs.filter((j) => !j.error && j.items.length && j.name.trim());
+  function updateSaveButton() {
+    const n = savable().length;
+    $('#import-save').disabled = n === 0;
+    $('#import-save').textContent = n > 1 ? `حفظ (${n} مواد)` : 'حفظ';
+  }
+  $('#import-list').addEventListener('input', (e) => {
+    const el = e.target.closest('.imp-name');
+    if (!el) return;
+    const job = jobs[+el.dataset.i];
+    job.name = el.value;
+    job.replace = sameName(job);
+    el.closest('.imp').querySelector('.imp-replace').textContent = replaceText(job);
+    updateSaveButton();
+  });
+  $('#import-list').addEventListener('change', (e) => {
+    const sel = e.target.closest('select[data-imp]');
+    if (!sel) return;
+    const job = jobs[+sel.dataset.i], s = job.sheets[+sel.dataset.s];
+    s[sel.dataset.imp] = sel.value === '' ? null : +sel.value;
+    applyMap(s); recompute(job); renderJobs();
+  });
+  $('#import-list').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-imp="remove"]');
+    if (!b) return;
+    jobs.splice(+b.dataset.i, 1); renderJobs();
+  });
+  $('#import-cancel').addEventListener('click', () => { jobs = []; $('#import-dialog').close(); });
+  $('#import-save').addEventListener('click', saveJobs);
+
+  async function saveJobs() {
+    const todo = savable();
+    if (!todo.length) return;
+    $('#import-save').disabled = true;
+    const saved = [];
+    try {
+      for (const job of todo) {
+        const name = job.name.trim();
+        const same = sameName(job);
+        const number = same ? same.number : await Store.nextNumber();
+        const items = Importer.assignIds(job.items, number);
+        await Store.put({ number, name, count: items.length, version: Importer.hashItems(items), file: job.file.name, added: Date.now() }, items);
+        for (const k of [...subjectCache.keys()]) if (k.startsWith(number + ':')) subjectCache.delete(k);
+        saved.push(number);
+      }
+    } catch (e) {
+      console.warn('save', e);
+      $('#import-error').textContent = e && e.code === 'too_many' ? XL_ERRORS.too_many : 'تعذر حفظ الملفات على هذا الهاتف. تأكد من وجود مساحة كافية وحاول مرة أخرى.';
+      $('#import-error').hidden = false;
+      $('#import-save').disabled = false;
+      return;
+    }
+    if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {}); // ask the browser not to evict the data
+    jobs = [];
+    $('#import-dialog').close();
+    await reloadLibrary();
+    refreshLibraryUI();
+    const keep = settings.subject && (settings.subject === 'all' || subjectByNumber(settings.subject));
+    await setSubject(saved.length === 1 || !keep ? saved[0] : settings.subject);
+    setStatus(saved.length === 1 ? 'تم حفظ المادة' : `تم حفظ ${saved.length} مواد`);
+    setTimeout(() => { if ($('#status-line').textContent.startsWith('تم حفظ')) setStatus(''); }, 4000);
+    if ($('#manage-dialog').open) renderManage();
+  }
+
+  // ---------- managing uploaded subjects ----------
+  function renderManage() {
+    $('#manage-list').innerHTML = manifest.subjects.length ? manifest.subjects.map((s) => `
+      <div class="mrow" data-n="${s.number}">
+        <div class="mname"><b>${esc(s.name)}</b><small>${s.count} سؤال${s.source === 'bundled' ? ' · مدمجة في التطبيق' : ''}</small></div>
+        ${s.source === 'user' ? `<div class="mbtns">
+          <button data-mg="rename">✎ الاسم</button><button data-mg="update">↻ تحديث</button><button data-mg="delete" class="danger">🗑 حذف</button></div>` : ''}
+      </div>`).join('') : '<p class="notice">لا توجد مواد بعد.</p>';
+  }
+  $('#btn-manage').addEventListener('click', () => { renderManage(); $('#manage-dialog').showModal(); });
+  $('#manage-close').addEventListener('click', () => $('#manage-dialog').close());
+  $('#manage-list').addEventListener('click', async (e) => {
+    const b = e.target.closest('[data-mg]');
+    if (!b) return;
+    const s = subjectByNumber(b.closest('.mrow').dataset.n);
+    if (!s || s.source !== 'user') return;
+    if (b.dataset.mg === 'rename') {
+      const name = (window.prompt('اسم المادة', s.name) || '').trim();
+      if (!name || name === s.name) return;
+      await Store.rename(s.number, name);
+      await reloadAndReapply();
+      renderManage();
+    } else if (b.dataset.mg === 'update') {
+      $('#manage-dialog').close();
+      openFilePicker(s.number);
+    } else if (b.dataset.mg === 'delete') {
+      if (!window.confirm(`حذف مادة «${s.name}» و${s.count} سؤال من هذا الهاتف؟`)) return;
+      await Store.remove(s.number);
+      for (const k of [...subjectCache.keys()]) if (k.startsWith(s.number + ':')) subjectCache.delete(k);
+      await reloadAndReapply();
+      renderManage();
+    }
+  });
 
   // ---------- settings dialog ----------
   $('#btn-settings').addEventListener('click', () => { $('#opt-auto-run').checked = settings.autoRun; $('#opt-debug').checked = settings.debug; $('#settings').showModal(); });

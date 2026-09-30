@@ -88,15 +88,37 @@ def dice(a: set, b: set) -> float:
 # ---------------------------------------------------------------------------
 # Column detection
 # ---------------------------------------------------------------------------
-Q_HEADERS = re.compile(r"(سؤال|السؤال|الاسئله|الأسئلة|question|^q$|^q\d*$)", re.IGNORECASE)
-A_HEADERS = re.compile(r"(اجابه|الاجابه|إجابة|الإجابة|جواب|الجواب|الصحيح|answer|^a$|^ans$|correct)", re.IGNORECASE)
+def hnorm(text):
+    """Header normalization: like normalize() but keeps digits, so a header "1" stays "1"."""
+    t = unicodedata.normalize("NFKC", str(text)).translate(_ARABIC_DIGITS)
+    t = _TASHKEEL.sub("", t).translate(_LETTER_MAP).lower()
+    t = _NON_WORD.sub(" ", t).replace("_", " ")
+    return _WS.sub(" ", t).strip()
+
+
+# Header words, matched on hnorm() forms so "الاجابة", "الإجابة" and "اجابه" are all the same.
+Q_WORDS = [hnorm(w) for w in ("سؤال", "السؤال", "أسئلة", "الأسئلة", "question", "questions")]
+A_WORDS = [hnorm(w) for w in ("إجابة", "الإجابة", "جواب", "الجواب", "الصحيح", "answer", "correct answer", "correct")]
+Q_EXACT = re.compile(r"q\d*")
+A_EXACT = re.compile(r"a|ans")
+
+
+def header_score(hn, words, exact):
+    """3 = exact word, 2 = word at either end ("رقم السؤال"), 1 = contained, 0 = no match."""
+    if hn in words or exact.fullmatch(hn):
+        return 3
+    if any(hn.startswith(w + " ") or hn.endswith(" " + w) for w in words):
+        return 2
+    return 1 if any(w in hn for w in words) else 0
+
+
 OPT_HEADERS = {
     "ا": ["أ", "ا", "a", "option a", "option 1", "الاختيار الأول", "اختيار 1", "1"],
     "ب": ["ب", "b", "option b", "option 2", "الاختيار الثاني", "اختيار 2", "2"],
     "ج": ["ج", "c", "option c", "option 3", "الاختيار الثالث", "اختيار 3", "3"],
     "د": ["د", "d", "option d", "option 4", "الاختيار الرابع", "اختيار 4", "4"],
 }
-OPT_LOOKUP = {normalize(h): key for key, hs in OPT_HEADERS.items() for h in hs}
+OPT_LOOKUP = {hnorm(h): key for key, hs in OPT_HEADERS.items() for h in hs}
 OPT_DISPLAY = {"ا": "أ", "ب": "ب", "ج": "ج", "د": "د"}
 LETTER_ANSWER = {
     "ا": "ا", "أ": "ا", "a": "ا", "1": "ا",
@@ -116,25 +138,26 @@ def cell_str(v):
 
 def detect_columns(header_row, q_override=None, a_override=None):
     """Return (q_idx, a_idx, {letter: idx}) or None if no question column found."""
-    headers = [cell_str(h) for h in header_row]
-    q_idx = a_idx = None
-    opts = {}
-    for i, h in enumerate(headers):
-        if not h:
-            continue
-        hn = normalize(h)
-        if q_override and hn == normalize(q_override):
-            q_idx = i
-        elif a_override and hn == normalize(a_override):
-            a_idx = i
-        elif not q_override and q_idx is None and Q_HEADERS.search(h):
-            q_idx = i
-        elif not a_override and a_idx is None and A_HEADERS.search(h):
-            a_idx = i
-        elif hn in OPT_LOOKUP:
-            opts[OPT_LOOKUP[hn]] = i
+    hns = [hnorm(cell_str(h)) if cell_str(h) else "" for h in header_row]
+
+    def pick(words, exact, override, exclude):
+        best, best_i = 0, None
+        for i, hn in enumerate(hns):
+            if not hn or i in exclude:
+                continue
+            s = (3 if hn == hnorm(override) else 0) if override else header_score(hn, words, exact)
+            if s > best:  # first column wins ties
+                best, best_i = s, i
+        return best_i
+
+    q_idx = pick(Q_WORDS, Q_EXACT, q_override, set())
     if q_idx is None:
         return None
+    a_idx = pick(A_WORDS, A_EXACT, a_override, {q_idx})
+    opts = {}
+    for i, hn in enumerate(hns):
+        if i not in (q_idx, a_idx) and hn in OPT_LOOKUP:
+            opts[OPT_LOOKUP[hn]] = i
     return q_idx, a_idx, opts
 
 
@@ -142,14 +165,20 @@ def read_sheet(ws, args, report):
     rows = list(ws.iter_rows(values_only=True))
     if not rows:
         return []
-    # find the header row within the first 10 rows
+    # find the header row within the first 10 rows: the first row that has BOTH a question and an answer
+    # column (a title row such as "أسئلة مادة الجغرافيا" has a question word but no answer column)
     header_at = None
     cols = None
+    partial = None  # first row with only a question column, used when no row has both
     for r in range(min(10, len(rows))):
-        cols = detect_columns(rows[r], args.q_col, args.a_col)
-        if cols:
-            header_at = r
+        found = detect_columns(rows[r], args.q_col, args.a_col)
+        if found and found[1] is not None:
+            header_at, cols = r, found
             break
+        if found and partial is None:
+            partial = (r, found)
+    if cols is None and partial:
+        header_at, cols = partial
     if cols is None:
         # fallback: first two text columns, no header
         report.append(f"  ! no header found, using first two text columns")

@@ -1,15 +1,19 @@
 // Golden set runner: pushes real phone photos through the real app UI (Playwright) and
 // reports accuracy and timing per OCR mode. This is the acceptance test before shipping.
 //
-//   tests/golden/labels.csv     lines of:  filename,expected_id     (# comments allowed)
+//   tests/golden/labels.csv     lines of:  filename,expected     (# comments allowed)
 //   tests/golden/*.jpg          the photos (git-ignored)
 //
-// The expected id also names the subject (id = subject number * 100000 + row), so the runner selects
-// that subject in the app before each photo. That is the normal way people use the app.
+// "expected" is either a question id (subject number * 100000 + position) or  SubjectName#position,
+// e.g.  IMG_0007.jpg,الفيزياء#17  = question 17 of the subject named الفيزياء. The position is the number
+// shown as #17 next to a question when "عرض النص المقروء (للتشخيص)" is on in the app settings. Either way the
+// runner selects that subject in the app before each photo, which is the normal way people use the app.
 //   --subject all   selects "كل المواد" for every photo instead: the worst case (largest search span)
+//   --excel <dir|a.xlsx,b.xlsx>  uploads these workbooks through the app's upload dialog first (needed when
+//                   the app has no built-in subjects, which is the normal case: users upload their own)
 //
-// Run against the deployed app:   node tests/golden_run.js --url https://answer-app.<you>.workers.dev --mode auto
-// Run against the local mock:     node tests/golden_run.js --mock --mode local
+// Run against the deployed app:   node tests/golden_run.js --url https://answer-app.<you>.workers.dev --excel ./my-excel --mode auto
+// Run against the local mock:     node tests/golden_run.js --mock --excel ./my-excel --mode local
 // Writes tests/golden/results-<mode>[-all].json and prints the summary, overall and per subject.
 'use strict';
 const fs = require('fs');
@@ -24,8 +28,15 @@ const DIR = path.join(__dirname, 'golden');
 const labelsFile = path.join(DIR, 'labels.csv');
 if (!fs.existsSync(labelsFile)) { console.error('missing tests/golden/labels.csv'); process.exit(2); }
 const cases = fs.readFileSync(labelsFile, 'utf8').split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'))
-  .map((l) => { const [file, id] = l.split(','); const expected = Number(id); return { file: file.trim(), expected, subject: Math.floor(expected / 100000) }; });
+  .map((l) => { const i = l.indexOf(','); return { file: l.slice(0, i).trim(), spec: l.slice(i + 1).trim(), expected: null, subject: null }; });
 const ALL = args.subject === 'all';
+const MIME = { xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', xlsm: 'application/vnd.ms-excel.sheet.macroEnabled.12', csv: 'text/csv' };
+function excelFiles(spec) {
+  const list = fs.existsSync(spec) && fs.statSync(spec).isDirectory()
+    ? fs.readdirSync(spec).filter((f) => /\.(xlsx|xlsm|csv)$/i.test(f) && !f.startsWith('~$')).sort().map((f) => path.join(spec, f))
+    : String(spec).split(',').map((s) => s.trim()).filter(Boolean);
+  return list.map((f) => ({ name: path.basename(f), mimeType: MIME[f.split('.').pop().toLowerCase()] || 'application/octet-stream', buffer: fs.readFileSync(f) }));
+}
 
 (async () => {
   let mock = null, url = args.url;
@@ -41,7 +52,31 @@ const ALL = args.subject === 'all';
   // give the local OCR engine time to warm up, as a real user opening the app would
   if (MODE !== 'google') await page.waitForTimeout(3000);
 
-  await page.waitForSelector('#subject option[value]:not([disabled])', { state: 'attached' });
+  if (args.excel && args.excel !== true) {
+    const payloads = excelFiles(args.excel);
+    if (!payloads.length) { console.error('no Excel/CSV files found in --excel'); process.exit(2); }
+    await page.setInputFiles('#xl-input', payloads);
+    await page.waitForSelector('#import-dialog[open] .imp');
+    const cardsInfo = await page.evaluate(() => [...document.querySelectorAll('#import-list .imp')].map((c) => ({
+      name: c.querySelector('.imp-name').value, count: (c.querySelector('.imp-count') || {}).textContent, notes: [...c.querySelectorAll('.imp-note,.notice.error')].map((n) => n.textContent) })));
+    console.log('uploaded:'); cardsInfo.forEach((c) => console.log(`  ${c.name}: ${c.count}${c.notes.length ? '\n    ' + c.notes.join('\n    ') : ''}`));
+    if (await page.isDisabled('#import-save')) { console.error('nothing could be imported'); process.exit(2); }
+    await page.click('#import-save');
+    await page.waitForSelector('#import-dialog', { state: 'hidden' });
+  }
+  await page.waitForSelector('#subject option[value]:not([disabled])', { state: 'attached', timeout: 15000 }).catch(() => {
+    console.error('the app has no subjects: pass --excel <dir> to upload the question files'); process.exit(2);
+  });
+  // resolve the expected question of each photo (id, or SubjectName#position) and its subject
+  const subjects = await page.evaluate(() => [...document.querySelectorAll('#subject option[value]:not([disabled])')]
+    .filter((o) => o.value !== 'all').map((o) => ({ number: Number(o.value), name: o.textContent.trim().replace(/ \(\d+\)$/, '') })));
+  for (const c of cases) {
+    if (/^\d+$/.test(c.spec)) { c.expected = Number(c.spec); c.subject = Math.floor(c.expected / 100000); continue; }
+    const m = /^(.+)#(\d+)$/.exec(c.spec);
+    const s = m && subjects.find((x) => x.name === m[1].trim());
+    if (!s) { console.error(`label "${c.file},${c.spec}": no subject named "${m ? m[1] : c.spec}" (have: ${subjects.map((x) => x.name).join(', ')})`); process.exit(2); }
+    c.expected = s.number * 100000 + Number(m[2]); c.subject = s.number;
+  }
   let selected = null;
   async function selectSubject(value) { // value: subject number or 'all'
     if (selected === String(value)) return;

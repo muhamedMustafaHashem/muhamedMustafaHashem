@@ -1,5 +1,6 @@
-# Golden photo set: one line per photo, "filename,expected question id".
-# Ids come from public/data/<subject number>.json; id = subject number * 100000 + row, so the
-# subject is implied (subject 2, row 17 -> 200017). Put the photos next to this file (git-ignored).
+# Golden photo set: one line per photo, "filename,expected". Put the photos next to this file (git-ignored).
+# expected = SubjectName#position  (question 17 of the subject named الفيزياء -> الفيزياء#17)
+#            or a question id (subject number * 100000 + position, e.g. 1001 * 100000 + 17 = 100100017).
+# The position is the "#17" shown next to a question when "عرض النص المقروء (للتشخيص)" is on in the app settings.
 # Example:
-# IMG_0001.jpg,200017
+# IMG_0001.jpg,الفيزياء#17

@@ -10,6 +10,9 @@ const M = require('../public/matcher.js');
 
 const PUB = path.join(__dirname, '..', 'public');
 const PORT = Number(process.argv[2] || process.env.PORT || 8080);
+// Built-in subjects (public/data by default). DATA_DIR=<dir> serves another folder as /data/, DATA_DIR=none serves none.
+const DATA_DIR = process.env.DATA_DIR === 'none' ? null : (process.env.DATA_DIR || path.join(PUB, 'data'));
+let lastVerify = ''; // raw body of the latest /api/verify request, for the privacy test
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'application/javascript', '.css': 'text/css', '.json': 'application/json',
   '.png': 'image/png', '.wasm': 'application/wasm', '.traineddata': 'application/octet-stream', '.txt': 'text/plain' };
 
@@ -33,7 +36,9 @@ http.createServer(async (req, res) => {
     const delay = Number(process.env.MOCK_DELAY || 300);
     await new Promise((r) => setTimeout(r, delay));
     if (url.pathname === '/api/ocr') return send({ text: ocrText, ms: delay });
+    if (url.pathname === '/api/_last_verify') return send({ text: lastVerify });
     if (url.pathname === '/api/verify') {
+      lastVerify = body.toString('utf8');
       const cands = JSON.parse(field(body, req.headers['content-type'], 'candidates') || '[]');
       const hint = field(body, req.headers['content-type'], 'ocr') || ocrText;
       const idx = M.buildIndex(cands.map((c) => ({ id: c.id, q: c.q, a: '' })));
@@ -47,8 +52,12 @@ http.createServer(async (req, res) => {
     return send({ error: 'not found' }, 404);
   }
   let p = decodeURIComponent(url.pathname); if (p === '/') p = '/index.html';
-  const f = path.join(PUB, p);
-  if (!f.startsWith(PUB) || !fs.existsSync(f) || fs.statSync(f).isDirectory()) { res.writeHead(404); return res.end('not found'); }
+  let f = path.join(PUB, p);
+  if (p.startsWith('/data/')) {
+    if (!DATA_DIR) { res.writeHead(404); return res.end('no built-in subjects'); }
+    f = path.join(DATA_DIR, p.slice('/data/'.length));
+    if (!f.startsWith(DATA_DIR) || !fs.existsSync(f) || fs.statSync(f).isDirectory()) { res.writeHead(404); return res.end('not found'); }
+  } else if (!f.startsWith(PUB) || !fs.existsSync(f) || fs.statSync(f).isDirectory()) { res.writeHead(404); return res.end('not found'); }
   res.writeHead(200, { 'content-type': MIME[path.extname(f)] || 'application/octet-stream', 'cache-control': 'no-store' });
   fs.createReadStream(f).pipe(res);
 }).listen(PORT, () => console.log(`mock server on http://localhost:${PORT}`));
