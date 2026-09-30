@@ -137,25 +137,41 @@
   function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
   const TIER_NAME = { A: 'قراءة محلية', B: 'قراءة جوجل', C: 'تحقق ذكي' };
 
-  function renderConfident(items, tier, debugText) {
-    const html = items.map((best) => `
+  function renderConfident(best, via, debugText) {
+    $('#result').innerHTML = `
       <article class="answer confident">
-        <span class="badge ok">✓ مؤكد · ${TIER_NAME[tier]}</span>
+        <span class="badge ok">✓ مؤكد · ${esc(via)}</span>
         <p class="q">${esc(best.q)}</p>
         <p class="a">${esc(best.a)}</p>
-      </article>`).join('');
-    $('#result').innerHTML = html + debugBlock(debugText);
+      </article>` + debugBlock(debugText);
   }
+  // Verification could not run (offline / API down): show the most likely question with its answer
+  // visible but clearly marked unverified, plus the runners-up to tap.
+  function renderLikely(cands, note, debugText) {
+    const [top, ...rest] = cands;
+    const cards = rest.map(candCard).join('');
+    $('#result').innerHTML = `
+      <article class="answer unverified">
+        <span class="badge warn">الأرجح · غير مؤكد</span>
+        <p class="q">${esc(top.q)} <span class="score">${Math.round(top.score * 100)}%</span></p>
+        <p class="a">${esc(top.a)}</p>
+        <p class="src">${esc(note)}</p>
+      </article>${cards}${debugBlock(debugText)}`;
+    bindCards();
+  }
+  // Verifier rejected or unsure: answers stay hidden until the user taps the matching question.
   function renderCandidates(cands, debugText, note) {
-    const cards = cands.map((c) => `
-      <article class="cand" data-id="${c.id}">
+    $('#result').innerHTML = `<div class="answer unverified"><span class="badge warn">غير مؤكد</span>
+      <p class="q">${esc(note || 'لم أتأكد من السؤال. اضغط على السؤال المطابق لعرض إجابته، أو قص السؤال وأعد المحاولة.')}</p></div>${cands.map(candCard).join('')}${debugBlock(debugText)}`;
+    bindCards();
+  }
+  function candCard(c) {
+    return `<article class="cand" data-id="${c.id}">
         <p class="q">${esc(c.q)} <span class="score">${Math.round(c.score * 100)}%</span></p>
         <p class="a">${esc(c.a)}</p>
-      </article>`).join('');
-    $('#result').innerHTML = `<div class="answer unverified"><span class="badge warn">غير مؤكد</span>
-      <p class="q">${esc(note || 'لم أتأكد من السؤال. اضغط على السؤال المطابق لعرض إجابته، أو قص السؤال وأعد المحاولة.')}</p></div>${cards}${debugBlock(debugText)}`;
-    document.querySelectorAll('.cand').forEach((el) => el.addEventListener('click', () => el.classList.toggle('open')));
+      </article>`;
   }
+  function bindCards() { document.querySelectorAll('.cand').forEach((el) => el.addEventListener('click', () => el.classList.toggle('open'))); }
   function renderNotice(text, isError, debugText) {
     $('#result').innerHTML = `<p class="notice${isError ? ' error' : ''}">${esc(text)}</p>${debugBlock(debugText)}`;
   }
@@ -163,22 +179,16 @@
 
   // ---------- matching ----------
   function analyse(text) {
-    // several numbered questions in one photo -> answer each if all are confident
-    const parts = M.splitQuestions(text);
-    if (parts.length > 1) {
-      const per = parts.map((p) => M.decide(M.rank(index, p), C.thresholds));
-      if (per.every((d) => d.status === 'confident')) {
-        const ids = new Set();
-        const bests = per.map((d) => d.best).filter((b) => !ids.has(b.id) && ids.add(b.id));
-        return { status: 'confident', bests, candidates: [] };
-      }
-    }
     const ranked = M.rank(index, text, 10);
-    const d = M.decide(ranked, C.thresholds);
-    return { status: d.status, bests: d.best ? [d.best] : [], candidates: d.status === 'none' ? [] : ranked };
+    const decision = M.decide(ranked, C.thresholds);
+    const multi = M.splitQuestions(text).length > 1;
+    return { ranked, decision, multi };
   }
 
-  // ---------- pipeline ----------
+  // ---------- pipeline (accuracy first) ----------
+  // OCR tiers only produce the candidate list. A green "مؤكد" answer requires the verifier to look at
+  // the photo and pick a candidate with high confidence, that candidate to be in the OCR top 3, and the
+  // verifier's own transcription of the photo to match that same question.
   let run = null; // current run context
   async function startRun(blob) {
     if (run) run.cancel();
@@ -208,10 +218,15 @@
       pending[tier] = false;
       const r = analyse(text);
       ctx.results[tier] = { text, r };
-      chip(tier, r.status === 'confident' ? 'done' : 'fail');
-      if (r.status === 'confident') return finish(() => renderConfident(r.bests, tier, text));
-      // not confident: verify with the best OCR we have, preferring Google's text
-      if (tier === 'B' || !pending.B) maybeVerify();
+      chip(tier, r.decision.status === 'confident' ? 'done' : r.decision.status === 'none' ? 'fail' : 'partial');
+      // Optional fast path, off by default: two independent OCR engines confident on the same question.
+      if (C.fastPath && ctx.results.A && ctx.results.B) {
+        const a = ctx.results.A.r.decision, b = ctx.results.B.r.decision;
+        if (a.status === 'confident' && b.status === 'confident' && a.best.id === b.best.id) return finish(() => renderConfident(a.best, 'قراءتان متطابقتان', text));
+      }
+      // Start verification as soon as the candidate list is trustworthy: a confident OCR read,
+      // Google's read (better than local), or the last read we are going to get.
+      if (r.decision.status === 'confident' || tier === 'B' || !pending.B) maybeVerify();
     }
     function onOcrFail(tier, err) {
       if (ctx.done) return;
@@ -220,37 +235,57 @@
       console.warn(tier, err);
       if (!pending.A && !pending.B) maybeVerify();
     }
-    function bestResult() { return ctx.results.B || ctx.results.A || null; }
+    // Union of both OCR rankings (Google first), so a word one engine misread does not drop the right question.
+    function merged() {
+      const order = [ctx.results.B, ctx.results.A].filter(Boolean);
+      const seen = new Set(), list = [];
+      for (const res of order) for (const c of res.r.ranked) if (!seen.has(c.id) && seen.add(c.id)) list.push(c);
+      list.sort((x, y) => y.score - x.score);
+      const primary = order[0];
+      return { list: list.slice(0, 10), text: primary ? primary.text : '', multi: order.some((o) => o.r.multi) };
+    }
     async function maybeVerify() {
       if (ctx.done || ctx.verifyStarted) return;
-      const br = bestResult();
-      if (!br) return finish(() => renderNotice('تعذرت قراءة الصورة. حاول التصوير في إضاءة أفضل.', true));
-      if (br.r.status === 'none' || !online) {
-        return finish(() => br.r.status === 'none'
-          ? renderNotice('لم أجد السؤال، حاول تصوير السؤال أقرب وبوضوح.', false, br.text)
-          : renderCandidates(br.r.candidates.slice(0, 3), br.text, online ? undefined : 'لا يوجد إنترنت للتحقق. اختر السؤال المطابق:'));
+      const m = merged();
+      const stillWaiting = pending.A || pending.B;
+      if (!m.list.length || m.list[0].score < C.thresholds.min) {
+        if (stillWaiting) return; // the other engine may still read it
+        return finish(() => m.text.trim()
+          ? renderNotice('لم أجد السؤال، حاول تصوير السؤال أقرب وبوضوح.', false, m.text)
+          : renderNotice('تعذرت قراءة الصورة. حاول التصوير في إضاءة أفضل.', true));
       }
+      if (m.multi) return finish(() => renderCandidates(m.list.slice(0, 3), m.text, 'الصورة تحتوي على أكثر من سؤال. قص السؤال المطلوب وأعد المحاولة، أو اضغط على السؤال المطابق.'));
+      if (!online) return finish(() => renderLikely(m.list.slice(0, 3), 'لا يوجد إنترنت للتحقق من الصورة. تأكد بنفسك أن السؤال مطابق.', m.text));
       ctx.verifyStarted = true;
       chip('C', 'running');
       const t = withTimeout(C.verifyTimeoutMs); ctx.aborters.push(t);
       try {
-        const v = await verify(blob, br.r.candidates, br.text, t.signal);
+        const v = await verify(blob, m.list, m.text, t.signal);
         t.cancel();
         if (ctx.done) return;
-        const top3 = br.r.candidates.slice(0, 3).map((c) => c.id);
-        const hit = br.r.candidates.find((c) => c.id === v.match_id);
-        if (hit && v.confidence === 'high' && top3.includes(hit.id)) {
+        const hit = m.list.find((c) => c.id === v.match_id);
+        const inTop3 = hit && m.list.slice(0, 3).some((c) => c.id === hit.id);
+        // cross-check: the verifier's own transcription of the photo must match the chosen question
+        let transcriptionOk = !C.verify.requireTranscription;
+        if (hit && v.photo_question) {
+          const tr = M.rank(index, v.photo_question, 3);
+          transcriptionOk = !!tr.length && tr[0].id === hit.id && tr[0].score >= C.verify.transcriptionMinScore;
+        }
+        const debug = m.text + (v.photo_question ? '\n--- verifier read ---\n' + v.photo_question : '') + (v.reason ? '\n--- ' + v.reason : '');
+        if (hit && v.confidence === 'high' && inTop3 && transcriptionOk) {
           chip('C', 'done');
-          finish(() => renderConfident([hit], 'C', br.text));
+          finish(() => renderConfident(hit, 'تم التحقق من الصورة', debug));
         } else {
           chip('C', 'fail');
-          finish(() => renderCandidates(br.r.candidates.slice(0, 3), br.text));
+          finish(() => renderCandidates(m.list.slice(0, 3), debug, hit
+            ? 'التحقق لم يؤكد التطابق. اضغط على السؤال المطابق لعرض إجابته، أو قص السؤال وأعد المحاولة.'
+            : undefined));
         }
       } catch (err) {
         if (ctx.done) return;
         chip('C', 'fail');
         console.warn('verify', err);
-        finish(() => renderCandidates(br.r.candidates.slice(0, 3), br.text, 'تعذر التحقق عبر الإنترنت. اختر السؤال المطابق:'));
+        finish(() => renderLikely(m.list.slice(0, 3), 'تعذر التحقق عبر الإنترنت. تأكد بنفسك أن السؤال مطابق.', m.text));
       }
     }
 

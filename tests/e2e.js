@@ -28,12 +28,13 @@ function startMock(env) {
   return new Promise((ok) => p.stdout.on('data', () => ok(p)));
 }
 
-async function runCase(browser, { name, mode, item, mockOcr, expectTier, expectStatus, timeoutMs, options }) {
+async function runCase(browser, { name, mode, item, mockOcr, expectTier, expectStatus, timeoutMs, options, breakVerify }) {
   const png = await renderQuestion(browser, item, { options });
   const page = await browser.newPage({ viewport: { width: 400, height: 800 }, isMobile: true, hasTouch: true });
   const logs = [];
   page.on('console', (m) => { if (m.type() === 'error' || m.type() === 'warning') logs.push(m.text()); });
   page.on('pageerror', (e) => logs.push('pageerror ' + e.message));
+  if (breakVerify) await page.route('**/api/verify', (route) => route.abort());
   await page.route('**/api/ocr', (route) => route.continue({ headers: { ...route.request().headers(), 'x-mock-ocr': encodeURIComponent(mockOcr || '') } }));
   await page.addInitScript(() => localStorage.setItem('answer-app', JSON.stringify({ debug: true })));
   await page.goto(`http://localhost:${PORT}/`);
@@ -58,7 +59,7 @@ async function runCase(browser, { name, mode, item, mockOcr, expectTier, expectS
   });
   const ms = Date.now() - t0;
   await page.close();
-  const tierOk = !expectTier || res.badge.includes({ A: 'محلية', B: 'جوجل', C: 'تحقق' }[expectTier]);
+  const tierOk = !expectTier || res.badge.includes({ AB: 'قراءتان', C: 'تحقق', L: 'الأرجح' }[expectTier]);
   const statusOk = res.status === expectStatus;
   const answerOk = expectStatus !== 'confident' || res.a.trim() === item.a;
   const ok = tierOk && statusOk && answerOk;
@@ -74,19 +75,21 @@ async function runCase(browser, { name, mode, item, mockOcr, expectTier, expectS
   const results = [];
   try {
     const q1 = Q[0], q2 = Q[1], q3 = Q[3], q4 = Q[12];
-    // Tier B (Google mock returns clean text) -> confident via B
-    results.push(await runCase(browser, { name: 'cloud clean', mode: 'google', item: q1, mockOcr: `7- ${q1.q}\nأ) القاهرة ب) الإسكندرية`, expectTier: 'B', expectStatus: 'confident' }));
+    // Google mock returns clean text -> candidates -> verifier confirms (accuracy first: always verified)
+    results.push(await runCase(browser, { name: 'cloud clean', mode: 'google', item: q1, mockOcr: `7- ${q1.q}\nأ) القاهرة ب) الإسكندرية`, expectTier: 'C', expectStatus: 'confident' }));
     // Tier B returns garbage -> verifier (mock) picks the right one using the OCR hint from... nothing -> candidates
     results.push(await runCase(browser, { name: 'cloud unreadable', mode: 'google', item: q2, mockOcr: 'نص غير مفهوم تماماً', expectStatus: 'notice' }));
     // Tier B partial (one distinctive word missing) -> not confident -> Tier C (mock verifier) confirms
     results.push(await runCase(browser, { name: 'cloud partial -> verify', mode: 'google', item: q2, mockOcr: 'ما هو اطول نهر في', expectTier: 'C', expectStatus: 'confident' }));
     // Tier A: real Tesseract on a rendered image, local mode (no network OCR)
-    results.push(await runCase(browser, { name: 'local tesseract', mode: 'local', item: q3, expectTier: 'A', expectStatus: 'confident', options: true }));
-    results.push(await runCase(browser, { name: 'local tesseract 2', mode: 'local', item: q4, expectTier: 'A', expectStatus: 'confident' }));
+    results.push(await runCase(browser, { name: 'local tesseract', mode: 'local', item: q3, expectTier: 'C', expectStatus: 'confident', options: true }));
+    results.push(await runCase(browser, { name: 'local tesseract 2', mode: 'local', item: q4, expectTier: 'C', expectStatus: 'confident' }));
+    // verifier unreachable -> never a green answer; most likely question shown as unverified
+    results.push(await runCase(browser, { name: 'verify down -> likely', mode: 'local', item: q4, breakVerify: true, expectTier: 'L', expectStatus: 'candidates' }));
     // Tier A with a poor photo of a question containing a Latin letter -> not confident -> verifier
     results.push(await runCase(browser, { name: 'local -> verify', mode: 'local', item: Q[5], expectTier: 'C', expectStatus: 'confident' }));
-    // Auto: both race; Google mock is faster and clean -> B wins
-    results.push(await runCase(browser, { name: 'auto race', mode: 'auto', item: q1, mockOcr: `${q1.q}`, expectStatus: 'confident' }));
+    // Auto: both OCRs run, verifier starts on Google's read
+    results.push(await runCase(browser, { name: 'auto', mode: 'auto', item: q1, mockOcr: `${q1.q}`, expectTier: 'C', expectStatus: 'confident' }));
   } finally {
     await browser.close();
     mock.kill();

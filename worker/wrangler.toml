@@ -12,7 +12,7 @@ not_found_handling = "404-page"
 [vars]
 # Model used by /api/verify. Cheaper/faster alternative: "claude-haiku-4-5"
 CLAUDE_MODEL = "claude-opus-5-5"
-CLAUDE_EFFORT = "low"
+CLAUDE_EFFORT = "medium"   # "low" is a bit faster; keep "medium" for accuracy
 # Comma-separated origins allowed to call the API from another domain. Empty = same origin only.
 ALLOWED_ORIGINS = ""
 

@@ -58,6 +58,7 @@ body { padding-bottom: env(safe-area-inset-bottom); }
 .chip { padding: 3px 10px; border-radius: 20px; background: var(--card); border: 1px solid var(--border); color: var(--muted); }
 .chip[data-state="running"] { border-color: var(--brand); color: var(--brand); animation: pulse 1s infinite; }
 .chip[data-state="done"] { background: var(--ok-bg); color: var(--ok); border-color: var(--ok); }
+.chip[data-state="partial"] { background: var(--warn-bg); color: var(--warn); border-color: var(--warn); }
 .chip[data-state="fail"] { background: var(--warn-bg); color: var(--warn); border-color: var(--warn); }
 .chip[data-state="skip"] { opacity: .45; }
 .elapsed { margin-inline-start: auto; color: var(--muted); font-variant-numeric: tabular-nums; }

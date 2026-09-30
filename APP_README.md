@@ -14,7 +14,7 @@ photo ──► local OCR (Tesseract, on the phone)  ─┐
                                                                                   top 3 candidates (tap to reveal)
 ```
 
-The app never shows a single answer as correct unless one of the tiers passes the confidence rule.
+The app never shows a single answer as correct unless the photo verifier confirms it (see Confidence rule).
 The OCR mode switch on the main screen (تلقائي / محلي / جوجل) chooses which OCR tiers run.
 
 ## Layout
@@ -77,19 +77,30 @@ Send the link with this note:
 iPhone cannot install an app file from WhatsApp; the link plus "Add to Home Screen" is the supported
 route on both platforms and gives a home-screen icon that opens full screen and offline.
 
-## Confidence rule
+## Confidence rule (accuracy first, speed second)
 
-Every OCR result is normalized (diacritics, hamza forms, ة/ه, ى/ي, punctuation, numbering) and scored
-against each question: half unigram coverage, half ordered-bigram coverage, tolerant to one or two
-character errors per word and to words glued together by OCR. A result is **confident** only when
+OCR only produces the candidate list. Every OCR read is normalized (diacritics, hamza forms, ة/ه, ى/ي,
+punctuation, numbering) and scored against each question: half unigram coverage, half ordered-bigram
+coverage, tolerant to one or two character errors per word and to words glued together by OCR. Local
+and Google readings are merged (union of their top 10), so a word one engine misread does not drop the
+right question.
 
-- the top question scores ≥ 0.92, and
-- no other question scores ≥ 0.92, and
-- the top leads the runner-up by ≥ 0.10.
+A green **مؤكد** answer is shown only when all of these hold:
 
-Otherwise the photo and the top 10 candidates go to the Claude verifier, which must return
-`confidence: "high"` for an id that is also in the local top 3. Thresholds live in `public/config.js`;
-tune them on the golden set, then freeze them.
+1. the Claude verifier, looking at the photo itself, picks a candidate with `confidence: "high"`;
+2. that candidate is in the OCR top 3;
+3. the verifier's own transcription of the question in the photo ranks that same question first with a
+   match score ≥ 0.85 (`verify.transcriptionMinScore` in `public/config.js`).
+
+Anything else is orange: either the top 3 candidates with answers hidden until tapped (verifier said
+no), or, when the verifier cannot run at all (offline, API down), the most likely question marked
+**الأرجح · غير مؤكد** with its answer visible so the user can judge for themselves.
+
+Speed comes second but is not ignored: verification starts as soon as a trustworthy candidate list
+exists (a confident OCR read, or Google's read), so the typical online path is Google OCR ≈ 1 s plus
+the verifier ≈ 1.5 to 2 s. `fastPath: true` in `config.js` re-enables the shortcut "local and Google
+OCR both confident on the same question → answer without the verifier"; keep it off unless the golden
+set proves it never misfires.
 
 ## Tests
 
@@ -108,7 +119,7 @@ node tests/golden_run.js --url https://answer-app.<you>.workers.dev --mode local
 node tests/golden_run.js --url https://answer-app.<you>.workers.dev --mode google
 ```
 
-Targets: **0 wrong confident answers**, ≥ 95 % of photos get a confident answer, median time under 1.5 s.
+Targets: **0 wrong confident answers**, ≥ 95 % of photos get a confident answer, median time under 3 s.
 
 ## Local development
 

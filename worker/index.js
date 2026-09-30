@@ -12,8 +12,9 @@ const DEFAULT_MODEL = 'claude-opus-5-5';
 const VERIFY_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['match_id', 'confidence', 'reason'],
+  required: ['photo_question', 'match_id', 'confidence', 'reason'],
   properties: {
+    photo_question: { type: 'string', description: 'the question text exactly as written in the photo, Arabic, without the answer options; empty string if unreadable' },
     match_id: { type: ['integer', 'null'], description: 'id of the candidate that is the same question as in the photo, or null' },
     confidence: { type: 'string', enum: ['high', 'low'] },
     reason: { type: 'string', description: 'one short sentence' },
@@ -25,7 +26,7 @@ The photo shows an Arabic exam question, possibly with answer options, numbering
 You receive a numbered list of candidate questions (id + text) and, as a hint only, the raw OCR text.
 
 Rules:
-- Read the question in the photo yourself; do not trust the OCR text when it disagrees with the photo.
+- First transcribe the question in the photo yourself into photo_question, exactly as written (no options). Do not trust the OCR text when it disagrees with the photo.
 - Return match_id only when a candidate asks the same question as the photo (same meaning, same subject). Small OCR-style differences in spelling, diacritics, punctuation or numbering do not matter.
 - Two candidates that differ in a key word (e.g. "أطول" vs "أقصر", "العالم" vs "أفريقيا", a year or a number) are different questions; pick the one whose key words match the photo.
 - If the photo contains several questions, answer for the one that fills most of the image or is most prominent.
@@ -109,9 +110,9 @@ async function verifyWithClaude(bytes, type, candidates, ocrText, env) {
   const model = env.CLAUDE_MODEL || DEFAULT_MODEL;
   const response = await client.beta.messages.create({
     model,
-    max_tokens: 300,
+    max_tokens: 600,
     system: SYSTEM_PROMPT,
-    output_config: { effort: env.CLAUDE_EFFORT || 'low', format: { type: 'json_schema', schema: VERIFY_SCHEMA } },
+    output_config: { effort: env.CLAUDE_EFFORT || 'medium', format: { type: 'json_schema', schema: VERIFY_SCHEMA } },
     betas: ['server-side-fallback-2026-07-01'],
     fallbacks: 'default',
     messages: [{
@@ -122,13 +123,19 @@ async function verifyWithClaude(bytes, type, candidates, ocrText, env) {
       ],
     }],
   });
-  if (response.stop_reason === 'refusal') return { match_id: null, confidence: 'low', reason: 'refused' };
+  if (response.stop_reason === 'refusal') return { match_id: null, confidence: 'low', photo_question: '', reason: 'refused' };
   const text = response.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
   let parsed;
-  try { parsed = JSON.parse(text); } catch { return { match_id: null, confidence: 'low', reason: 'unparseable' }; }
+  try { parsed = JSON.parse(text); } catch { return { match_id: null, confidence: 'low', photo_question: '', reason: 'unparseable' }; }
   const ids = new Set(candidates.map((c) => c.id));
   const matchId = Number.isInteger(parsed.match_id) && ids.has(parsed.match_id) ? parsed.match_id : null;
-  return { match_id: matchId, confidence: matchId && parsed.confidence === 'high' ? 'high' : 'low', reason: String(parsed.reason || '').slice(0, 200), model: response.model };
+  return {
+    match_id: matchId,
+    confidence: matchId && parsed.confidence === 'high' ? 'high' : 'low',
+    photo_question: String(parsed.photo_question || '').slice(0, 500),
+    reason: String(parsed.reason || '').slice(0, 200),
+    model: response.model,
+  };
 }
 
 export default {

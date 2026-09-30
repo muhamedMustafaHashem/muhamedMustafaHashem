@@ -8,7 +8,16 @@ window.APP_CONFIG = {
   // Cloud OCR timeout before we stop waiting and go to the verifier.
   cloudOcrTimeoutMs: 4000,
   verifyTimeoutMs: 12000,
-  // Confidence rule (tune on the golden set, then freeze).
+  // Accuracy first: a green answer always needs the photo verifier (Claude) to agree.
+  verify: {
+    // the verifier's own transcription of the photo must rank the chosen question first with this score
+    requireTranscription: true,
+    transcriptionMinScore: 0.85,
+  },
+  // Optional speed shortcut, OFF: accept without the verifier when local AND Google OCR are both
+  // confident on the same question. Turn on only after the golden set shows it never misfires.
+  fastPath: false,
+  // OCR match rule used to rank candidates and to judge an OCR read "confident".
   // confident = top >= score AND no other candidate >= score AND top - second >= lead
   thresholds: { score: 0.92, lead: 0.10, min: 0.30 },
   // Longest image side sent to OCR / verifier.

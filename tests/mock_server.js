@@ -39,7 +39,9 @@ http.createServer(async (req, res) => {
       const idx = M.buildIndex(cands.map((c) => ({ id: c.id, q: c.q, a: '' })));
       const ranked = M.rank(idx, hint, 3);
       const best = ranked[0];
-      return send({ match_id: best && best.score >= 0.6 ? best.id : null, confidence: best && best.score >= 0.8 ? 'high' : 'low', reason: 'mock', ms: delay });
+      const ok = best && best.score >= 0.6;
+      // a real verifier transcribes the photo; the mock pretends it read the picked question exactly
+      return send({ match_id: ok ? best.id : null, confidence: best && best.score >= 0.8 ? 'high' : 'low', photo_question: ok ? best.q : hint, reason: 'mock', ms: delay });
     }
     if (url.pathname === '/api/health') return send({ ok: true, mock: true });
     return send({ error: 'not found' }, 404);

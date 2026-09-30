@@ -60,7 +60,7 @@ const cases = fs.readFileSync(labelsFile, 'utf8').split('\n').map((l) => l.trim(
       const M = window.Matcher; const n = M.normalize(qText);
       const it = window.__items && window.__items.find((i) => i.n === n); return it ? it.id : null;
     }, r.matched_q);
-    const tier = r.badge.includes('محلية') ? 'A' : r.badge.includes('جوجل') ? 'B' : r.badge.includes('تحقق') ? 'C' : '';
+    const tier = r.badge.includes('تحقق') ? 'C' : r.badge.includes('قراءتان') ? 'AB' : '';
     const correct = r.status === 'confident' ? shownId === c.expected : null;
     results.push({ ...c, status: r.status, tier, shownId, correct, inCandidates: r.cands.includes(c.expected), ms });
     console.log(`${c.file}: ${r.status}${tier ? ' via ' + tier : ''} ${ms} ms ${correct === true ? 'OK' : correct === false ? 'WRONG!' : ''}`);
@@ -73,7 +73,7 @@ const cases = fs.readFileSync(labelsFile, 'utf8').split('\n').map((l) => l.trim(
   const wrong = conf.filter((r) => r.correct === false);
   const times = results.filter((r) => r.ms).map((r) => r.ms).sort((a, b) => a - b);
   const med = times.length ? times[Math.floor(times.length / 2)] : 0;
-  const byTier = ['A', 'B', 'C'].map((t) => `${t}=${conf.filter((r) => r.tier === t).length}`).join(' ');
+  const byTier = ['C', 'AB'].map((t) => `${t}=${conf.filter((r) => r.tier === t).length}`).join(' ');
   console.log('\n=== golden summary (mode ' + MODE + ') ===');
   console.log(`photos: ${n}`);
   console.log(`confident answers: ${conf.length} (${Math.round(100 * conf.length / n)}%), by tier ${byTier}`);
