@@ -142,6 +142,23 @@ iPhone cannot install an app file from WhatsApp; the link plus "Add to Home Scre
 route on both platforms and gives a home-screen icon that opens full screen and offline. Installing to
 the Home Screen also protects the uploaded questions from being cleared by Safari.
 
+## Photo check on or off (`VERIFY_MODE`)
+
+The Gemini confirmation step is a switch in `worker/wrangler.toml`; the app reads it from `/api/health` (and
+remembers it for offline starts), so changing it needs only `wrangler deploy`.
+
+| | `VERIFY_MODE = "gemini"` (default) | `VERIFY_MODE = "off"` |
+|---|---|---|
+| Green answer when | Gemini confirms the question from the photo (rule below) | the phone's reader **and** the cloud reader independently reach a confident match on the same question, with no same-question-different-answer twin |
+| Readers that run | as chosen by the OCR switch | both always (the switch cannot turn the phone reader off) |
+| Extra cost and time | about USD 0.001 and 1 to 2 s | none |
+| Keys | Gemini | Gemini (for cloud reading) or Cloud Vision |
+| Misses | very rare | a photo that shows a slightly different question than the stored one can still match, and so can a misread key word that both readers misread the same way |
+
+With the check off, a single confident reader gives the orange "likely, unverified" card, disagreeing readers
+give "likely" too, and nothing is ever green from one reader alone. Run the golden set in both modes before
+choosing: if Gemini never changes a result on your photos, switch it off and save the time and the cost.
+
 ## Confidence rule (accuracy first, speed second)
 
 OCR only produces the candidate list. Every OCR read is normalized (diacritics, hamza forms, ة/ه, ى/ي,
@@ -150,7 +167,7 @@ coverage, tolerant to one or two character errors per word and to words glued to
 and Google readings are merged (union of their top 10), so a word one engine misread does not drop the
 right question.
 
-A green **مؤكد** answer is shown only when all of these hold:
+With `VERIFY_MODE = "gemini"`, a green **مؤكد** answer is shown only when all of these hold:
 
 1. the Gemini verifier, looking at the photo itself, picks a candidate with `confidence: "high"`;
 2. that candidate is in the OCR top 3;
@@ -192,6 +209,8 @@ node tests/golden_run.js --url https://answer-app.<you>.workers.dev --excel ./my
 node tests/golden_run.js --url https://answer-app.<you>.workers.dev --excel ./my-excel-files --mode auto --subject all   # worst case
 ```
 
+Run the set once per `VERIFY_MODE` (deploy with `"gemini"`, run, deploy with `"off"`, run) and compare: the summary's
+"by tier" counts show how many green answers came from the photo check (`C`) and from two agreeing readers (`AB`).
 The summary is printed overall and per subject. Targets: **0 wrong confident answers** in every run
 (including `--subject all`), ≥ 95 % of photos get a confident answer with the subject selected, median
 time under 3 s.

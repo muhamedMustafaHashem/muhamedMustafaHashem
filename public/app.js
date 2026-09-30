@@ -16,11 +16,32 @@
     local: 'القراءة على الهاتف فقط، تعمل بدون إنترنت، أبطأ في الصور الصعبة.',
     google: 'القراءة عبر جوجل فقط، أدق وأسرع لكنها تحتاج إنترنت.',
   };
+  // Photo-check mode, set on the server (VERIFY_MODE in wrangler.toml): 'gemini' = a model confirms the
+  // question from the photo before a green answer; 'off' = green only when the phone's reader and the
+  // cloud reader independently agree on the same question. Read from /api/health at start, remembered
+  // for offline starts.
+  let verifyMode = settings.verifyMode || 'gemini';
+  const verifierOn = () => verifyMode !== 'off';
+  let modeReady = Promise.resolve(); // resolves when /api/health has answered (or failed)
+  async function loadVerifyMode() {
+    try {
+      const res = await fetch(apiUrl('health'), { cache: 'no-store' });
+      if (!res.ok) return;
+      const j = await res.json();
+      if (j.verify === 'off' || j.verify === 'gemini') { verifyMode = j.verify; settings.verifyMode = j.verify; save(); }
+    } catch { /* offline: keep the remembered mode */ }
+    document.body.dataset.verify = verifyMode;
+    $('#mode-hint').textContent = modeHint(settings.mode);
+  }
+  function modeHint(mode) {
+    if (!verifierOn()) return MODE_HINTS[mode] + ' التحقق بالصورة مطفأ: الإجابة الخضراء تحتاج اتفاق القراءة المحلية وجوجل معاً، لذا تعمل القراءتان دائماً.';
+    return MODE_HINTS[mode];
+  }
   function setMode(mode) {
     settings.mode = mode; save();
     document.querySelectorAll('#mode button').forEach((b) => b.setAttribute('aria-checked', String(b.dataset.mode === mode)));
-    $('#mode-hint').textContent = MODE_HINTS[mode];
-    if (mode !== 'google') warmLocalOcr();
+    $('#mode-hint').textContent = modeHint(mode);
+    if (mode !== 'google' || !verifierOn()) warmLocalOcr();
   }
   document.querySelectorAll('#mode button').forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode)));
 
@@ -159,17 +180,22 @@
   }
   // Tesseract reads best when text is 20-40 px tall, so local OCR runs on a smaller copy of the
   // photo (cloud OCR gets the full 1600 px). If the first pass finds almost nothing, retry smaller.
+  // No single size reads every line (very large or very small glyphs both fail), so try several sizes,
+  // keep the read that matches the question bank best, and stop as soon as one is confident.
   async function localOcr(blob) {
     const worker = await warmLocalOcr();
-    const sides = C.tesseract.sides || [1000, 700];
-    let text = '';
+    const sides = C.tesseract.sides || [1000, 800, 700, 1300];
+    let best = { text: '', score: -1 };
     for (const side of sides) {
       const small = await resizeBlob(blob, side);
       const { data } = await worker.recognize(small);
-      text = data.text || '';
-      if (M.tokens(M.normalize(text)).length >= 3) break;
+      const text = data.text || '';
+      const ranked = index ? M.rank(index, text, 2) : [];
+      const score = ranked.length ? ranked[0].score : 0;
+      if (score > best.score) best = { text, score };
+      if (index && M.decide(ranked, C.thresholds).status === 'confident') break;
     }
-    return text;
+    return best.text;
   }
   async function resizeBlob(blob, maxSide) {
     const bmp = await createImageBitmap(blob);
@@ -336,6 +362,8 @@
   // the OCR engines are skipped and the same text is ranked against the new index, then verified again.
   async function startRun(blob, opts) {
     opts = opts || {};
+    // a photo taken in the first moments waits (briefly) for the server to say whether the photo check is on
+    await Promise.race([modeReady, new Promise((ok) => setTimeout(ok, 1500))]);
     if (run) run.cancel();
     const mode = settings.mode;
     const online = navigator.onLine;
@@ -349,11 +377,13 @@
     startTimer();
 
     const reuse = opts.reuse || null;
-    const useA = !reuse && mode !== 'google';
+    const noVerifier = !verifierOn();
+    // without the photo check, a green answer needs both readers, so the local one always runs
+    const useA = !reuse && (mode !== 'google' || noVerifier);
     const useB = !reuse && mode !== 'local' && online;
     chip('A', useA ? 'running' : 'skip');
     chip('B', useB ? 'running' : (online ? 'skip' : 'fail'));
-    chip('C', online ? 'idle' : 'skip');
+    chip('C', online && !noVerifier ? 'idle' : 'skip');
     const markDone = () => { $('#view-work').dataset.done = '1'; };
     if (!reuse && !useA && !useB) { stopTimer(); renderNotice('لا يوجد اتصال بالإنترنت. اختر وضع "محلي" للقراءة بدون إنترنت.', true); markDone(); return; }
 
@@ -367,10 +397,13 @@
       const r = analyse(text);
       ctx.results[tier] = { text, r };
       chip(tier, r.decision.status === 'confident' ? 'done' : r.decision.status === 'none' ? 'fail' : 'partial');
-      // Optional fast path, off by default: two independent OCR engines confident on the same question.
-      if (C.fastPath && ctx.results.A && ctx.results.B) {
+      // Two independent OCR engines confident on the same question: the green rule when the photo check is
+      // off (VERIFY_MODE = "off"), or an optional fast path (fastPath in config.js) when it is on.
+      if ((noVerifier || C.fastPath) && ctx.results.A && ctx.results.B) {
         const a = ctx.results.A.r.decision, b = ctx.results.B.r.decision;
-        if (a.status === 'confident' && b.status === 'confident' && a.best.id === b.best.id) return finish(() => renderConfident(a.best, 'قراءتان متطابقتان', text));
+        if (a.status === 'confident' && b.status === 'confident' && a.best.id === b.best.id && !M.hasConflictingTwin(a.best, ctx.results.B.r.ranked)) {
+          return finish(() => renderConfident(a.best, 'قراءتان متطابقتان', text));
+        }
       }
       // Start verification as soon as the candidate list is trustworthy: a confident OCR read,
       // Google's read (better than local), or the last read we are going to get.
@@ -386,8 +419,9 @@
     // Union of both OCR rankings (Google first), so a word one engine misread does not drop the right question.
     function merged() {
       const order = [ctx.results.B, ctx.results.A].filter(Boolean);
-      const seen = new Set(), list = [];
-      for (const res of order) for (const c of res.r.ranked) if (!seen.has(c.id) && seen.add(c.id)) list.push(c);
+      const best = new Map(); // keep each question's best score over both readers: a weak read must not hide a strong one
+      for (const res of order) for (const c of res.r.ranked) { const cur = best.get(c.id); if (!cur || c.score > cur.score) best.set(c.id, c); }
+      const list = [...best.values()];
       list.sort((x, y) => y.score - x.score);
       const primary = order[0];
       return { list: list.slice(0, 10), text: primary ? primary.text : '', multi: order.some((o) => o.r.multi) };
@@ -403,6 +437,13 @@
           : renderNotice('تعذرت قراءة الصورة. حاول التصوير في إضاءة أفضل.', true, '', true));
       }
       if (m.multi) return finish(() => renderCandidates(m.list.slice(0, 3), m.text, 'الصورة تحتوي على أكثر من سؤال. قص السؤال المطلوب وأعد المحاولة، أو اضغط على السؤال المطابق.'));
+      if (noVerifier) {
+        if (stillWaiting) return; // the agreement rule needs both readers
+        const conf = ['A', 'B'].filter((t) => ctx.results[t] && ctx.results[t].r.decision.status === 'confident');
+        return finish(() => conf.length
+          ? renderLikely(m.list.slice(0, 3), conf.length === 2 ? 'القراءتان لم تتفقا على نفس السؤال. تأكد بنفسك أن السؤال مطابق.' : 'قراءة واحدة فقط واثقة، والتحقق بالصورة مطفأ. تأكد بنفسك أن السؤال مطابق.', m.text)
+          : renderCandidates(m.list.slice(0, 3), m.text));
+      }
       if (!online) return finish(() => renderLikely(m.list.slice(0, 3), 'لا يوجد إنترنت للتحقق من الصورة. تأكد بنفسك أن السؤال مطابق.', m.text));
       ctx.verifyStarted = true;
       chip('C', 'running');
@@ -796,6 +837,7 @@
   installHint();
   ready = bootData();
   ready.catch((e) => { console.warn(e); setStatus('تعذر تحميل الأسئلة، تحقق من الاتصال'); });
+  modeReady = loadVerifyMode();
   window.addEventListener('load', () => { if (settings.mode !== 'google') warmLocalOcr(); });
   window.addEventListener('online', () => { if (settings.mode !== 'local') setStatus(''); });
   window.addEventListener('offline', () => setStatus(settings.mode === 'google' ? 'لا يوجد إنترنت: وضع جوجل لن يعمل' : ''));

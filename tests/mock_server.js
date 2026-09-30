@@ -38,6 +38,7 @@ http.createServer(async (req, res) => {
     if (url.pathname === '/api/ocr') return send({ text: ocrText, ms: delay });
     if (url.pathname === '/api/_last_verify') return send({ text: lastVerify });
     if (url.pathname === '/api/verify') {
+      if (process.env.VERIFY_MODE === 'off') return send({ error: 'photo verification is off (VERIFY_MODE)' }, 503);
       lastVerify = body.toString('utf8');
       const cands = JSON.parse(field(body, req.headers['content-type'], 'candidates') || '[]');
       const hint = field(body, req.headers['content-type'], 'ocr') || ocrText;
@@ -48,7 +49,7 @@ http.createServer(async (req, res) => {
       // a real verifier transcribes the photo; the mock pretends it read the picked question exactly
       return send({ match_id: ok ? best.id : null, confidence: best && best.score >= 0.8 ? 'high' : 'low', photo_question: ok ? best.q : hint, reason: 'mock', ms: delay });
     }
-    if (url.pathname === '/api/health') return send({ ok: true, mock: true });
+    if (url.pathname === '/api/health') return send({ ok: true, mock: true, verify: process.env.VERIFY_MODE === 'off' ? 'off' : 'gemini' });
     return send({ error: 'not found' }, 404);
   }
   let p = decodeURIComponent(url.pathname); if (p === '/') p = '/index.html';

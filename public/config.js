@@ -34,6 +34,6 @@ window.APP_CONFIG = {
     langPath: 'vendor/lang',
     lang: 'ara',
     psm: 3,             // page segmentation: 3 = automatic
-    sides: [1000, 700], // local OCR runs on a copy this many px wide; retries smaller if it reads < 3 words
+    sides: [1000, 800, 700, 1300], // local OCR tries these widths in turn and keeps the best-matching read; stops early when confident
   },
 };

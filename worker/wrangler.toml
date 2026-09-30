@@ -17,6 +17,10 @@ GEMINI_MODEL = "gemini-3.1-flash-lite"
 # "gemini" reads the photo's text with the same model (one key, cheapest). "vision" uses Google Cloud Vision instead
 # (needs GOOGLE_VISION_KEY, about USD 1.50 per 1,000 photos after the first 1,000 each month).
 OCR_PROVIDER = "gemini"
+# Photo check before a green answer. "gemini": the model looks at the photo and confirms the question
+# (recommended; about USD 0.001 and 1-2 s per photo). "off": no confirmation call; the app shows a green
+# answer only when the phone's reader and the cloud reader independently agree on the same question.
+VERIFY_MODE = "gemini"
 # Thinking level for Gemini 3.x models ("low" is fastest and cheapest here; Gemini 2.x models use a zero budget).
 GEMINI_THINKING = "low"
 # Comma-separated origins allowed to call the API from another domain. Empty = same origin only.

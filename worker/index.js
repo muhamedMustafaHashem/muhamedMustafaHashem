@@ -2,7 +2,7 @@
  *   POST /api/ocr      image (multipart "image")                   -> { text }
  *   POST /api/verify   image + candidates JSON + ocr text          -> { match_id, confidence, photo_question, reason, usage, cost_usd }
  *   POST /api/selftest                                            -> checks the key and the model name with a tiny request
- *   GET  /api/health                                              -> { ok, model, ocr }
+ *   GET  /api/health                                              -> { ok, model, ocr, verify }
  * Static files in ../public are served by Workers Static Assets (see wrangler.toml).
  * Secrets:  GEMINI_API_KEY, APP_TOKEN            (wrangler secret put ...)
  * Optional: GOOGLE_VISION_KEY when OCR_PROVIDER = "vision" (Cloud Vision instead of Gemini for reading text). */
@@ -98,6 +98,9 @@ async function checkAccess(req, env) {
 
 // ---------- Gemini ----------
 const modelOf = (env) => env.GEMINI_MODEL || DEFAULT_MODEL;
+// VERIFY_MODE: "gemini" = the model confirms the question from the photo; "off" = no confirmation call,
+// the app then shows a green answer only when its two text readers agree on the same question.
+const verifyMode = (env) => (String(env.VERIFY_MODE || 'gemini').toLowerCase() === 'off' ? 'off' : 'gemini');
 
 // Gemini 2.x switches thinking off with a zero budget; Gemini 3.x takes a level. Thinking tokens are billed
 // as output, and reading one question needs none, so keep it as small as the model allows.
@@ -213,7 +216,7 @@ export default {
     if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
     try {
       if (url.pathname === '/api/health') {
-        return json({ ok: true, model: modelOf(env), ocr: env.OCR_PROVIDER || 'gemini', gemini: !!env.GEMINI_API_KEY }, 200, cors);
+        return json({ ok: true, model: modelOf(env), ocr: env.OCR_PROVIDER || 'gemini', verify: verifyMode(env), gemini: !!env.GEMINI_API_KEY }, 200, cors);
       }
       if (req.method !== 'POST') throw new HttpError(405, 'method not allowed');
       await checkAccess(req, env);
@@ -225,6 +228,7 @@ export default {
         return json({ ...out, ms: Date.now() - t0 }, 200, cors);
       }
       if (url.pathname === '/api/verify') {
+        if (verifyMode(env) === 'off') throw new HttpError(503, 'photo verification is off (VERIFY_MODE)');
         const { bytes, type, fields } = await readImage(req);
         let candidates;
         try { candidates = JSON.parse(fields.candidates || '[]'); } catch { throw new HttpError(400, 'candidates must be JSON'); }

@@ -111,7 +111,12 @@ script = [{ body: reply('{"ok": true}', { promptTokenCount: 12, candidatesTokenC
 r = await call(new Request('http://app/api/selftest', { method: 'POST', headers: { 'x-app-token': 't' } }));
 check(r.status === 200 && r.json.ok === true && r.json.model === 'gemini-3.1-flash-lite' && r.json.usage.input_tokens === 12, 'selftest confirms the key and model with a tiny request');
 r = await call(new Request('http://app/api/health'));
-check(r.json.ok && r.json.model === 'gemini-3.1-flash-lite' && r.json.gemini === true, 'health reports the model');
+check(r.json.ok && r.json.model === 'gemini-3.1-flash-lite' && r.json.gemini === true && r.json.verify === 'gemini', 'health reports the model and the verify mode');
+r = await call(new Request('http://app/api/health'), { ...ENV, VERIFY_MODE: 'off' });
+check(r.json.verify === 'off', 'VERIFY_MODE=off is reported by health');
+script = [{ body: reply('{"photo_question":"a","match_id":100001,"confidence":"high","reason":"r"}') }]; calls = [];
+r = await call(verifyReq(), { ...ENV, VERIFY_MODE: 'OFF' });
+check(r.status === 503 && r.json.error.includes('VERIFY_MODE') && calls.length === 0, 'VERIFY_MODE=off: /api/verify refuses without calling Gemini');
 r = await call(verifyReq({}, null));
 check(r.status === 401, 'a missing app token is rejected');
 r = await call(verifyReq({}, 'wrong'));

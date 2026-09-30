@@ -15,7 +15,7 @@ const os = require('os');
 let chromium;
 try { ({ chromium } = require('playwright')); } catch { ({ chromium } = require(path.join(require('child_process').execSync('npm root -g').toString().trim(), 'playwright'))); }
 
-const PORT_BUNDLED = 8123, PORT_UPLOAD = 8124;
+const PORT_BUNDLED = 8123, PORT_UPLOAD = 8124, PORT_NOVERIFY = 8126;
 const SAMPLE = path.join(__dirname, 'sample_bundled');
 const load = (f) => JSON.parse(fs.readFileSync(path.join(SAMPLE, f), 'utf8'));
 const bundled = load('manifest.json');
@@ -394,10 +394,55 @@ async function uploadSuite(browser) {
   await page.close();
 }
 
+// ------------------------------------------------------------------ suite D: photo check switched off (VERIFY_MODE=off)
+async function noVerifySuite(browser) {
+  const base = `http://localhost:${PORT_NOVERIFY}/`;
+  const capital = find(GEO, 'ما هي عاصمة جمهورية مصر');
+  const river = find(GEO, 'ما هو أطول نهر في العالم');
+  const days = find(GEO, 'كم عدد أيام السنة');
+  CTX = { mode: 'bundled', base };
+  // both readers agree (local Tesseract reads the rendered photo, mock cloud returns the clean text) -> green without any verify call
+  let page = await openApp(browser, { subject: 'geo', mockOcr: capital.q });
+  await page.waitForFunction(() => document.body.dataset.verify === 'off');
+  check('no-verify: the app learns the mode from /api/health and says so in the hint', (await page.textContent('#mode-hint')).includes('مطفأ'));
+  let r = await photo(browser, page, capital, 'auto');
+  check('no-verify: both readers agree -> green "قراءتان متطابقتان", verifier chip skipped', r.status === 'confident' && r.badge.includes('قراءتان') && r.a.trim() === capital.a && r.chips.includes('C:skip'), `${r.status} "${r.badge}" ${r.chips}`);
+  await page.close();
+  // Google-only mode still runs the local reader, because the rule needs two readers
+  page = await openApp(browser, { subject: 'geo', mockOcr: capital.q });
+  r = await photo(browser, page, capital, 'google');
+  check('no-verify: google mode still runs the phone reader and can be green', r.status === 'confident' && r.chips.includes('A:done'), `${r.status} ${r.chips}`);
+  await page.close();
+  // readers disagree (cloud text names another question) -> never green
+  page = await openApp(browser, { subject: 'geo', mockOcr: river.q });
+  r = await photo(browser, page, capital, 'auto');
+  check('no-verify: readers disagree -> orange "likely", never green', r.status === 'candidates' && r.badge.includes('الأرجح') && r.text.includes('لم تتفقا'), `${r.status} "${r.badge}"`);
+  await page.close();
+  // only one reader confident (cloud unreadable) -> orange
+  page = await openApp(browser, { subject: 'geo', mockOcr: 'نص غير مفهوم تماماً' });
+  r = await photo(browser, page, capital, 'auto');
+  check('no-verify: one confident reader only -> orange, says so', r.status === 'candidates' && r.text.includes('قراءة واحدة'), `${r.status} "${r.badge}" ${r.text.slice(0, 60)}`);
+  await page.close();
+  // same question with two answers in all subjects -> never green even when both readers agree
+  page = await openApp(browser, { subject: 'all', mockOcr: days.q });
+  r = await photo(browser, page, days, 'auto');
+  check('no-verify: a question with two different answers is never green', r.status !== 'confident', `${r.status} "${r.badge}"`);
+  await page.close();
+  // the remembered mode survives a start without network access to /api/health
+  page = await newPage(browser);
+  await page.route('**/api/health', (route) => route.abort());
+  await page.goto(base);
+  await page.waitForSelector('#subject option[value="1"]', { state: 'attached' });
+  await page.waitForTimeout(400);
+  check('no-verify: a fresh page with no health reply falls back to "gemini" (safe default)', await page.evaluate(() => document.body.dataset.verify) === 'gemini');
+  await page.close();
+}
+
 // ------------------------------------------------------------------ run
 (async () => {
   const mockBundled = await startMock(PORT_BUNDLED, { MOCK_DELAY: '200', DATA_DIR: SAMPLE });
   const mockUpload = await startMock(PORT_UPLOAD, { MOCK_DELAY: '200', DATA_DIR: 'none' });
+  const mockNoVerify = await startMock(PORT_NOVERIFY, { MOCK_DELAY: '200', DATA_DIR: SAMPLE, VERIFY_MODE: 'off' });
   const browser = await chromium.launch();
   try {
     for (const mode of ['bundled', 'upload']) {
@@ -409,9 +454,10 @@ async function uploadSuite(browser) {
     }
     PREFIX = '';
     await uploadSuite(browser);
+    await noVerifySuite(browser);
   } finally {
     await browser.close();
-    mockBundled.kill(); mockUpload.kill();
+    mockBundled.kill(); mockUpload.kill(); mockNoVerify.kill();
   }
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
