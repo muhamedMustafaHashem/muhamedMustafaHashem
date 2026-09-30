@@ -1,3 +1,5 @@
-# Golden photo set: one line per photo, "filename,expected question id" (ids from public/questions.json).
-# Put the photos next to this file (they are git-ignored). Example:
-# IMG_0001.jpg,17
+# Golden photo set: one line per photo, "filename,expected question id".
+# Ids come from public/data/<subject number>.json; id = subject number * 100000 + row, so the
+# subject is implied (subject 2, row 17 -> 200017). Put the photos next to this file (git-ignored).
+# Example:
+# IMG_0001.jpg,200017

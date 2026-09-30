@@ -4,44 +4,67 @@ A tiny installable web app (PWA): photograph an Arabic exam question, get the co
 own Excel question bank. Works on iPhone (Safari) and Android (Chrome), shared as one link on WhatsApp.
 
 ```
-photo ──► local OCR (Tesseract, on the phone)  ─┐
-      └─► Google Vision OCR (cloud)             ─┴─► match against questions.json ──► confident? ──► answer ✓
-                                                                  │ not confident
-                                                                  ▼
-                                   photo + top 10 candidates ──► Claude verifier ──► confident? ──► answer ✓
-                                                                                         │ no
-                                                                                         ▼
-                                                                                  top 3 candidates (tap to reveal)
+pick the subject ──► photo ──► local OCR (Tesseract, on the phone)  ─┐
+                          └─► Google Vision OCR (cloud)             ─┴─► rank against that subject's questions
+                                                                            │
+                                            photo + top 10 candidates ──► Claude verifier ──► confirmed? ──► answer ✓
+                                                                                                   │ no
+                                                                                                   ▼
+                                                     top 3 candidates (tap to reveal) · "search all subjects" · "edit text"
+
+or type the question ──► instant local search in the chosen subject (works offline)
 ```
 
-The app never shows a single answer as correct unless the photo verifier confirms it (see Confidence rule).
-The OCR mode switch on the main screen (تلقائي / محلي / جوجل) chooses which OCR tiers run.
+The app never shows a single answer as correct from a photo unless the photo verifier confirms it (see
+Confidence rule). The OCR mode switch (تلقائي / محلي / جوجل) chooses which OCR tiers run.
+
+## Subjects and typed search
+
+- **One Excel file = one subject.** The picker on the home screen lists them ("الفيزياء (412)") plus
+  "كل المواد". Searching inside one subject is more accurate (fewer look-alike questions) and faster.
+  The first launch asks for a subject; the choice is remembered. With a single subject the picker is hidden.
+- **Share one link per subject** on WhatsApp: `https://<your-app>/?subject=2` opens with subject 2 selected
+  (`?subject=all` for all subjects). Numbers are in `data/subjects.json`.
+- **Wrong subject?** If a photo is not found in the chosen subject, the result offers **ابحث في كل المواد**,
+  which re-ranks the text already read and verifies against the photo again (same accuracy rules).
+- **Same question in two subjects with different answers** is never shown green in "كل المواد"; both
+  entries are listed with their subject names. Identical question and answer in two subjects is merged.
+- **Typed search** (box under the camera button): type any part of the question, even half a word, in any
+  word order. Results highlight the matched words. "✓ مطابق" appears only for a full, unambiguous match;
+  otherwise the list is "نتائج مقترحة". It needs no internet and no API key. Under any unverified photo
+  result, **عدّل النص وابحث** copies the OCR text into this box so you can fix a word and search.
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `public/` | The PWA: `index.html`, `app.js` (flow + UI), `matcher.js` (normalization, ranking, confidence rule), `sw.js`, `manifest.json`, `config.js`, icons, vendored Tesseract.js and the Arabic model |
-| `public/questions.json` | Generated from your Excel files. **Currently the small sample set** until you provide the real sheets |
-| `tools/build_data.py` | Excel → `questions.json` with Arabic normalization and a quality report |
+| `public/` | The PWA: `index.html`, `app.js` (flow + UI), `matcher.js` (normalization, ranking, typed search, confidence rule), `sw.js`, `manifest.json`, `config.js`, icons, vendored Tesseract.js and the Arabic model |
+| `public/data/` | Generated from your Excel files: `manifest.json` and one `<number>.json` per subject. **Currently a two-subject sample** until you provide the real sheets |
+| `tools/build_data.py` | Excel files → per-subject JSON with Arabic normalization and a quality report |
+| `data/subjects.json` | Created by the first build: permanent number and display name per Excel file (commit it) |
 | `worker/` | Cloudflare Worker: `/api/ocr` (Google Vision) and `/api/verify` (Claude). Also serves `public/` |
-| `tests/` | Matcher unit test, Python/JS normalization parity test, browser end-to-end test, golden-set runner |
+| `tests/` | Unit, build, browser and golden-set tests; `tests/sample_subjects/` holds the sample workbooks |
 | `data/source/` | Put your `.xlsx` files here (git-ignored) |
 
 ## 1. Build the question bank
 
 ```bash
 pip install openpyxl
-cp /path/to/your/*.xlsx data/source/
-python3 tools/build_data.py            # writes public/questions.json and data/build_report.txt
+cp /path/to/subject-files/*.xlsx data/source/     # one file per subject, e.g. الفيزياء.xlsx
+python3 tools/build_data.py                        # writes public/data/*, data/subjects.json, data/build_report.txt
 ```
 
-The script reads every sheet of every workbook, finds the question and answer columns by header
-(`السؤال`, `الإجابة`, `Question`, `Answer`, …; force with `--q-col` / `--a-col`), resolves
-multiple-choice answers given as a letter (أ/ب/ج/د or A/B/C/D) to the option text when option columns
-exist, merges exact duplicates, and **refuses to build if the same question has two different answers**
-(fix the sheet, or `--allow-conflicts`). Read `data/build_report.txt`: near-duplicate questions listed
-there are the main cause of wrong answers, so clean them up in Excel and rebuild.
+Each file becomes one subject named after the file (edit `name` in `data/subjects.json` to rename; reorder
+the entries there to reorder the picker). All sheets of a file are merged into its subject. Every subject
+gets a permanent number the first time it is built, and question ids are `number * 100000 + row`, so ids
+stay valid when you add subjects later (removing a file keeps its number reserved).
+
+The script finds the question and answer columns by header (`السؤال`, `الإجابة`, `Question`, `Answer`, …;
+force with `--q-col` / `--a-col`), resolves multiple-choice answers given as a letter (أ/ب/ج/د or A/B/C/D)
+to the option text when option columns exist, merges exact duplicates, and **refuses to build if the same
+question has two different answers inside one subject** (fix the sheet, or `--allow-conflicts`). The
+same question in two different subjects is allowed and only reported. Read `data/build_report.txt`:
+near-duplicate questions listed there are the main cause of wrong answers, so clean them up in Excel and rebuild.
 
 ## 2. Keys and accounts (one-time)
 
@@ -106,20 +129,26 @@ set proves it never misfires.
 
 ```bash
 node tests/matcher.test.js                 # ranking + confidence rule on noisy variants (uses tests/sample.questions.json)
+node tests/search.test.js                  # typed search, twins and cross-subject rules on the two sample subjects
+python3 tests/build_subjects_test.py       # per-subject build: ids, stable numbers, conflicts, stale data
 python3 tests/normalize_parity.py          # Python and JS normalization agree
-NODE_PATH=$(npm root -g) node tests/e2e.js # browser test: renders questions, runs real Tesseract + mock API
+NODE_PATH=$(npm root -g) node tests/e2e.js # browser test: photo flow, subjects, typed search (real Tesseract + mock API)
 ```
 
 **Golden set (acceptance test before shipping):** put 100 real phone photos in `tests/golden/` and list
-them in `tests/golden/labels.csv` as `filename,expected_id`. Then:
+them in `tests/golden/labels.csv` as `filename,expected_id` (the id comes from `public/data/<n>.json`; it
+also names the subject, which the runner selects before each photo, like a real user). Then:
 
 ```bash
 node tests/golden_run.js --url https://answer-app.<you>.workers.dev --mode auto
 node tests/golden_run.js --url https://answer-app.<you>.workers.dev --mode local
 node tests/golden_run.js --url https://answer-app.<you>.workers.dev --mode google
+node tests/golden_run.js --url https://answer-app.<you>.workers.dev --mode auto --subject all   # worst case
 ```
 
-Targets: **0 wrong confident answers**, ≥ 95 % of photos get a confident answer, median time under 3 s.
+The summary is printed overall and per subject. Targets: **0 wrong confident answers** in every run
+(including `--subject all`), ≥ 95 % of photos get a confident answer with the subject selected, median
+time under 3 s.
 
 ## Local development
 

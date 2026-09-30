@@ -22,6 +22,12 @@
   </header>
 
   <main id="view-home" class="view">
+    <section class="card" id="subject-card" hidden>
+      <label class="mode-label" for="subject">المادة</label>
+      <select id="subject" aria-label="المادة"><option value="" disabled>جارٍ التحميل…</option></select>
+      <p id="subject-hint" class="hint"></p>
+    </section>
+
     <section class="card">
       <label class="mode-label">طريقة قراءة النص</label>
       <div class="segmented" id="mode" role="radiogroup">
@@ -38,6 +44,16 @@
       <span>التقط صورة للسؤال</span>
     </label>
     <button id="btn-gallery" class="link">أو اختر صورة من المعرض</button>
+
+    <section class="card" id="search-box">
+      <label class="mode-label" for="q-input">أو اكتب السؤال بنفسك</label>
+      <div class="search-row">
+        <input id="q-input" type="search" dir="rtl" enterkeyhint="search" autocomplete="off" autocapitalize="off"
+               spellcheck="false" placeholder="اكتب السؤال أو جزءاً منه…">
+        <button id="q-clear" class="clear-btn" aria-label="مسح" hidden>✕</button>
+      </div>
+      <div id="search-results"></div>
+    </section>
 
     <p id="status-line" class="status"></p>
     <p id="install-hint" class="install" hidden></p>

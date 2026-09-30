@@ -20,6 +20,8 @@ window.APP_CONFIG = {
   // OCR match rule used to rank candidates and to judge an OCR read "confident".
   // confident = top >= score AND no other candidate >= score AND top - second >= lead
   thresholds: { score: 0.92, lead: 0.10, min: 0.30 },
+  // Typed search box.
+  search: { minChars: 2, debounceMs: 150, maxResults: 8 },
   // Longest image side sent to OCR / verifier.
   maxImageSide: 1600,
   jpegQuality: 0.8,

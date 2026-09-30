@@ -60,12 +60,13 @@
     return 2;
   }
 
-  /** Build an index over items [{id,q,a,n}]. */
+  /** Build an index over items [{id,q,a,n,subject?}]. `subject` is set when several subjects are merged. */
   function buildIndex(items) {
     const inv = new Map();
     const docs = items.map((it) => {
-      const toks = tokens(it.n || normalize(it.q));
-      return { id: it.id, q: it.q, a: it.a, toks };
+      const norm = it.n || normalize(it.q);
+      const toks = tokens(norm);
+      return { id: it.id, q: it.q, a: it.a, n: norm, an: normalize(it.a), subject: it.subject, toks, set: new Set(toks) };
     });
     docs.forEach((d, di) => {
       new Set(d.toks).forEach((w) => {
@@ -78,7 +79,29 @@
     const commonCut = Math.max(20, Math.floor(docs.length * 0.2));
     const common = new Set();
     inv.forEach((arr, w) => { if (arr.length > commonCut) common.add(w); });
-    return { docs, inv, common, byId: new Map(docs.map((d) => [d.id, d])) };
+    const vocab = Array.from(inv.keys()).sort(); // sorted, for prefix lookups while typing
+    return { docs, inv, common, vocab, byId: new Map(docs.map((d) => [d.id, d])) };
+  }
+
+  /** Merge entries that are the same question with the same answer (e.g. in two subjects).
+   *  The first keeps its place and lists the other subjects in `also`. Entries with the same
+   *  question but a different answer stay separate: that is a real ambiguity. */
+  function collapseTwins(list) {
+    const seen = new Map();
+    const out = [];
+    for (const c of list) {
+      const key = c.n + '\u0001' + c.an;
+      const first = seen.get(key);
+      if (first) { if (c.subject && c.subject !== first.subject) (first.also = first.also || []).push(c.subject); continue; }
+      seen.set(key, c);
+      out.push(c);
+    }
+    return out;
+  }
+
+  /** True when another candidate is the same question with a different answer (cross-subject clash). */
+  function hasConflictingTwin(hit, list) {
+    return list.some((c) => c.id !== hit.id && c.n === hit.n && c.an !== hit.an);
   }
 
   /** Score one question against the OCR token list.
@@ -147,9 +170,72 @@
     // fallback: nothing shared exactly (heavy OCR noise) -> score everything
     if (shortlist.length === 0) shortlist = index.docs;
 
-    const scored = shortlist.map((d) => ({ id: d.id, q: d.q, a: d.a, score: scoreDoc(d, ocrToks, ocrSet) }));
+    const scored = shortlist.map((d) => ({ id: d.id, q: d.q, a: d.a, n: d.n, an: d.an, subject: d.subject, score: scoreDoc(d, ocrToks, ocrSet) }));
     scored.sort((x, y) => y.score - x.score || x.id - y.id);
-    return scored.slice(0, limit);
+    return collapseTwins(scored).slice(0, limit);
+  }
+
+  /** Typed search: the query may be a fragment, reordered, or still being typed.
+   *  score = 0.6 * (share of query words found in the question) + 0.4 * scoreDoc coverage of the question.
+   *  The last word also matches by prefix unless the user typed a space/punctuation after it or
+   *  opts.prefix === false (Enter pressed). */
+  function search(index, query, limit, opts) {
+    opts = opts || {};
+    limit = limit || 8;
+    const raw = String(query || '');
+    const qToks = tokens(normalize(raw));
+    if (!qToks.length || qToks.join('').length < (opts.minChars || 2)) return [];
+    const finished = /[\s؟?.!،,]$/.test(raw);
+    const prefixLast = opts.prefix !== false && !finished;
+    const lastIdx = qToks.length - 1;
+    const qSet = new Map();
+    qToks.forEach((w, i) => { if (!qSet.has(w)) qSet.set(w, i); });
+
+    // shortlist: docs sharing any non-common exact word, plus docs with a word starting with the last word
+    const hit = new Set();
+    qSet.forEach((_, w) => {
+      if (index.common.has(w)) return;
+      const arr = index.inv.get(w);
+      if (arr) for (const di of arr) hit.add(di);
+    });
+    if (prefixLast) {
+      const p = qToks[lastIdx];
+      let lo = 0, hi = index.vocab.length;
+      while (lo < hi) { const mid = (lo + hi) >> 1; if (index.vocab[mid] < p) lo = mid + 1; else hi = mid; }
+      for (let k = lo, n = 0; k < index.vocab.length && index.vocab[k].startsWith(p) && n < 60; k++, n++) {
+        for (const di of index.inv.get(index.vocab[k])) hit.add(di);
+      }
+    }
+    let shortlist = hit.size ? Array.from(hit, (di) => index.docs[di]) : index.docs; // typo-only query: scan all
+
+    const scored = shortlist.map((d) => {
+      let found = 0;
+      for (let i = 0; i < qToks.length; i++) {
+        const t = qToks[i];
+        if (d.set.has(t)) { found += 1; continue; }
+        if (prefixLast && i === lastIdx && t.length >= 2 && d.toks.some((w) => w.startsWith(t))) { found += 0.95; continue; }
+        const maxE = allowedEdits(t.length);
+        if (maxE > 0 && d.toks.some((w) => Math.abs(w.length - t.length) <= maxE && editDistance(t, w, maxE) <= maxE)) found += 0.85;
+      }
+      if (found === 0) return null; // none of the typed words is in this question
+      const queryCov = found / qToks.length;
+      return { id: d.id, q: d.q, a: d.a, n: d.n, an: d.an, subject: d.subject, len: d.toks.length,
+        score: 0.6 * queryCov + 0.4 * scoreDoc(d, qToks, qSet) };
+    }).filter(Boolean);
+    scored.sort((x, y) => y.score - x.score || x.len - y.len || x.id - y.id);
+    return collapseTwins(scored).slice(0, limit);
+  }
+
+  /** Split a question into [{text, hit}] parts; hit = the word matches a word of the typed query. */
+  function highlight(text, query) {
+    const qToks = tokens(normalize(query));
+    return String(text).split(/(\s+)/).map((part) => {
+      if (!part.trim()) return { text: part, hit: false };
+      const w = normalize(part);
+      const hit = !!w && qToks.some((t) => w === t || (t.length >= 2 && w.startsWith(t)) ||
+        (t.length >= 4 && editDistance(w, t, allowedEdits(t.length)) <= allowedEdits(t.length)));
+      return { text: part, hit };
+    });
   }
 
   // confident = top >= score AND no other candidate >= score AND top - second >= lead
@@ -174,5 +260,5 @@
     return parts.length >= 2 ? parts : [String(ocrText || '')];
   }
 
-  return { normalize, tokens, editDistance, buildIndex, rank, decide, splitQuestions, DEFAULT_THRESHOLDS };
+  return { normalize, tokens, editDistance, buildIndex, rank, search, highlight, decide, collapseTwins, hasConflictingTwin, splitQuestions, DEFAULT_THRESHOLDS };
 });

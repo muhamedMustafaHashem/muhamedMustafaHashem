@@ -1,6 +1,7 @@
-/* Service worker: app shell cached on install, questions.json and OCR assets cached on first use.
- * Bump CACHE when shipping a new app version; questions.json is refreshed in the background. */
-const CACHE = 'answer-app-v1';
+/* Service worker: app shell cached on install; question data and OCR assets cached on first use.
+ * data/manifest.json is served from cache and refreshed in the background; data/<n>.json?v=<version>
+ * files are immutable per version (cache first). Bump CACHE when shipping a new app version. */
+const CACHE = 'answer-app-v2';
 const SHELL = [
   './', 'index.html', 'style.css', 'app.js', 'matcher.js', 'config.js', 'manifest.json',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png',
@@ -25,13 +26,31 @@ self.addEventListener('fetch', (e) => {
   if (url.origin !== self.location.origin) return;
   if (url.pathname.includes('/api/')) return; // never cache API calls
 
-  // questions.json: serve cached copy instantly, refresh in the background
-  if (url.pathname.endsWith('questions.json')) {
+  // manifest: serve the cached copy instantly, refresh in the background
+  if (url.pathname.endsWith('/data/manifest.json')) {
     e.respondWith(
       caches.open(CACHE).then(async (c) => {
         const cached = await c.match(req);
         const network = fetch(req).then((res) => { if (res.ok) c.put(req, res.clone()); return res; }).catch(() => null);
         return cached || network || Response.error();
+      })
+    );
+    return;
+  }
+  // subject files: the URL carries the content version, so a cached copy is always right for it;
+  // offline with a newer manifest, fall back to any cached version of the same file
+  if (/\/data\/\d+\.json$/.test(url.pathname)) {
+    e.respondWith(
+      caches.open(CACHE).then(async (c) => {
+        const cached = await c.match(req);
+        if (cached) return cached;
+        try {
+          const res = await fetch(req);
+          if (res.ok) c.put(req, res.clone());
+          return res;
+        } catch (err) {
+          return (await c.match(req, { ignoreSearch: true })) || Response.error();
+        }
       })
     );
     return;

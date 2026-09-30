@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
-"""Build public/questions.json from the Excel sheets in data/source/.
+"""Build the per-subject question bank in public/data/ from the Excel files in data/source/.
+
+One Excel file = one subject (all its sheets are merged). The subject's display name is the
+file name without extension; edit `name` in data/subjects.json to change it. Each file gets a
+permanent number in that registry, and question ids are number * 100000 + row sequence, so ids
+stay unique across subjects and stable when files are added later.
+
+Output:
+    public/data/manifest.json    {version, subjects: [{number, name, count, file, version}]}
+    public/data/<number>.json    {number, name, version, count, items: [{id, q, a, n}]}
 
 Usage:
-    python3 tools/build_data.py                 # all .xlsx/.xlsm in data/source/
-    python3 tools/build_data.py file1.xlsx ...  # specific files
+    python3 tools/build_data.py                    # all .xlsx/.xlsm in data/source/
+    python3 tools/build_data.py a.xlsx b.xlsx      # specific files
     python3 tools/build_data.py --q-col "السؤال" --a-col "الإجابة"   # force columns
-    python3 tools/build_data.py --allow-conflicts   # ship even if same question has 2 answers
+    python3 tools/build_data.py --allow-conflicts  # ship even if one subject has a question with 2 answers
 
 The Arabic normalization here MUST stay identical to normalize() in
 public/matcher.js. tests/normalize_parity.py checks that.
 """
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -25,8 +35,10 @@ except ImportError:  # pragma: no cover
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE_DIR = ROOT / "data" / "source"
-OUT_FILE = ROOT / "public" / "questions.json"
+OUT_DIR = ROOT / "public" / "data"
+REGISTRY_FILE = ROOT / "data" / "subjects.json"
 REPORT_FILE = ROOT / "data" / "build_report.txt"
+ID_STRIDE = 100000  # question id = subject number * ID_STRIDE + row sequence
 
 # ---------------------------------------------------------------------------
 # Normalization (keep in sync with public/matcher.js)
@@ -173,45 +185,29 @@ def read_sheet(ws, args, report):
     return items
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("files", nargs="*")
-    ap.add_argument("--q-col")
-    ap.add_argument("--a-col")
-    ap.add_argument("--allow-conflicts", action="store_true")
-    ap.add_argument("--near", type=float, default=0.85, help="near-duplicate threshold")
-    ap.add_argument("--out", default=str(OUT_FILE))
-    args = ap.parse_args()
-
-    files = [Path(f) for f in args.files] or sorted(
-        p for p in SOURCE_DIR.glob("*") if p.suffix.lower() in (".xlsx", ".xlsm") and not p.name.startswith("~$")
-    )
-    if not files:
-        sys.exit(f"No Excel files found in {SOURCE_DIR}")
-
-    report = [f"build_data {datetime.now(timezone.utc).isoformat(timespec='seconds')}"]
+def read_subject(f, args, report):
+    """Read every sheet of one workbook; returns raw [{q, a, src}] rows."""
     raw = []
-    for f in files:
-        report.append(f"{f.name}")
-        wb = openpyxl.load_workbook(f, read_only=True, data_only=True)
-        for ws in wb.worksheets:
-            report.append(f" sheet '{ws.title}'")
-            items = read_sheet(ws, args, report)
-            for it in items:
-                it["src"] = f"{f.name}/{ws.title}"
-            report.append(f"  {len(items)} rows")
-            raw.extend(items)
+    wb = openpyxl.load_workbook(f, read_only=True, data_only=True)
+    for ws in wb.worksheets:
+        report.append(f" sheet '{ws.title}'")
+        items = read_sheet(ws, args, report)
+        for it in items:
+            it["src"] = f"{f.name}/{ws.title}"
+        report.append(f"  {len(items)} rows")
+        raw.extend(items)
+    return raw
 
-    # ---- quality gate -----------------------------------------------------
-    empty_answers = [it for it in raw if not it["a"]]
-    for it in empty_answers:
+
+def dedupe(raw, subject, report):
+    """Per-subject quality gate: empty answers dropped, exact duplicates merged, conflicts reported."""
+    empty = [it for it in raw if not it["a"]]
+    for it in empty:
         report.append(f"! EMPTY ANSWER ({it['src']}): {it['q'][:80]}")
-    raw = [it for it in raw if it["a"]]
-
-    by_norm = {}
-    conflicts = []
-    merged = 0
+    by_norm, conflicts, merged = {}, [], 0
     for it in raw:
+        if not it["a"]:
+            continue
         n = normalize(it["q"])
         if not n:
             continue
@@ -221,29 +217,25 @@ def main():
                 merged += 1
             else:
                 conflicts.append((prev, it))
-                prev.setdefault("alt", []).append(it["a"])
             continue
         by_norm[n] = {"q": it["q"], "a": it["a"], "n": n, "src": it["src"]}
-
     for prev, it in conflicts:
-        report.append(f"! CONFLICT same question, different answers ({prev['src']} vs {it['src']}):\n"
+        report.append(f"! CONFLICT in subject '{subject}', same question with different answers "
+                      f"({prev['src']} vs {it['src']}):\n"
                       f"    Q: {prev['q'][:100]}\n    A1: {prev['a'][:80]}\n    A2: {it['a'][:80]}")
+    return list(by_norm.values()), len(empty), merged, conflicts
 
-    items = list(by_norm.values())
-    for i, it in enumerate(items, 1):
-        it["id"] = i
 
-    # near duplicates (word-bigram Dice on a shortlist that shares words)
-    inv = {}
-    bigrams = {}
+def find_near_duplicates(items, threshold):
+    """Word-bigram Dice on a shortlist of questions that share words. Items need id and n."""
+    inv, bigrams = {}, {}
     for it in items:
         toks = tokens(it["n"])
         bigrams[it["id"]] = word_bigrams(toks)
         for w in set(toks):
             inv.setdefault(w, []).append(it["id"])
     by_id = {it["id"]: it for it in items}
-    seen = set()
-    near = []
+    seen, near = set(), []
     for it in items:
         cands = {}
         for w in set(tokens(it["n"])):
@@ -258,35 +250,137 @@ def main():
                 continue
             seen.add((it["id"], j))
             s = dice(bigrams[it["id"]], bigrams[j])
-            if s >= args.near:
+            if s >= threshold:
                 near.append((s, it, by_id[j]))
     near.sort(key=lambda x: -x[0])
-    for s, a, b in near:
-        same = "same answer" if normalize(a["a"]) == normalize(b["a"]) else "DIFFERENT answers"
-        report.append(f"~ near-duplicate {s:.2f} ({same}) #{a['id']} / #{b['id']}:\n"
-                      f"    {a['q'][:100]}\n    {b['q'][:100]}")
+    return near
 
-    out = {
-        "version": datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"),
-        "count": len(items),
-        "items": [{"id": it["id"], "q": it["q"], "a": it["a"], "n": it["n"]} for it in items],
-    }
-    summary = (f"\nrows read {len(raw) + len(empty_answers)}, empty answers {len(empty_answers)}, "
-               f"exact duplicates merged {merged}, conflicts {len(conflicts)}, "
-               f"near-duplicates {len(near)}, shipped {len(items)}")
+
+def sync_registry(registry, files):
+    """Give every source file a permanent subject number. Numbers of vanished files stay reserved."""
+    by_file = {r["file"]: r for r in registry}
+    nxt = max([r["number"] for r in registry], default=0) + 1
+    changed = False
+    for f in files:
+        if f.name not in by_file:
+            entry = {"file": f.name, "number": nxt, "name": f.stem}
+            registry.append(entry)
+            by_file[f.name] = entry
+            nxt += 1
+            changed = True
+    return by_file, changed
+
+
+def content_hash(obj):
+    return hashlib.sha1(json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()[:10]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("files", nargs="*", help="Excel files (default: every .xlsx/.xlsm in --source)")
+    ap.add_argument("--source", default=str(SOURCE_DIR))
+    ap.add_argument("--out-dir", default=str(OUT_DIR))
+    ap.add_argument("--registry", default=str(REGISTRY_FILE), help="subject numbers and names (editable)")
+    ap.add_argument("--report", default=str(REPORT_FILE))
+    ap.add_argument("--q-col")
+    ap.add_argument("--a-col")
+    ap.add_argument("--allow-conflicts", action="store_true")
+    ap.add_argument("--near", type=float, default=0.85, help="near-duplicate threshold")
+    args = ap.parse_args()
+
+    files = [Path(f) for f in args.files] or sorted(
+        p for p in Path(args.source).glob("*")
+        if p.suffix.lower() in (".xlsx", ".xlsm") and not p.name.startswith("~$")
+    )
+    if not files:
+        sys.exit(f"No Excel files found in {args.source}")
+
+    reg_path = Path(args.registry)
+    registry = json.loads(reg_path.read_text(encoding="utf-8")) if reg_path.exists() else []
+    by_file, reg_changed = sync_registry(registry, files)
+    for r in registry:
+        if r["file"] not in {f.name for f in files}:
+            print(f"note: '{r['file']}' (subject {r['number']}) is in the registry but not in this build; not shipped")
+
+    report = [f"build_data {datetime.now(timezone.utc).isoformat(timespec='seconds')}"]
+    subjects, all_conflicts, totals = [], [], {"read": 0, "empty": 0, "merged": 0, "near": 0}
+
+    for f in files:
+        entry = by_file[f.name]
+        report.append(f"{f.name}  ->  subject {entry['number']} '{entry['name']}'")
+        raw = read_subject(f, args, report)
+        items, empty, merged, conflicts = dedupe(raw, entry["name"], report)
+        if len(items) >= ID_STRIDE:
+            sys.exit(f"'{f.name}' has {len(items)} questions; at most {ID_STRIDE - 1} per subject")
+        for i, it in enumerate(items, 1):
+            it["id"] = entry["number"] * ID_STRIDE + i
+        near = find_near_duplicates(items, args.near)
+        for s, a, b in near:
+            same = "same answer" if normalize(a["a"]) == normalize(b["a"]) else "DIFFERENT answers"
+            report.append(f"~ near-duplicate in '{entry['name']}' {s:.2f} ({same}) #{a['id']} / #{b['id']}:\n"
+                          f"    {a['q'][:100]}\n    {b['q'][:100]}")
+        all_conflicts.extend(conflicts)
+        totals["read"] += len(raw)
+        totals["empty"] += empty
+        totals["merged"] += merged
+        totals["near"] += len(near)
+        subjects.append({"entry": entry, "items": items})
+        report.append(f"  => {len(items)} questions shipped")
+
+    # picker order = order of entries in data/subjects.json (edit that file to reorder)
+    subjects.sort(key=lambda s: registry.index(s["entry"]))
+
+    # same question in more than one subject: allowed (answers may differ by subject), reported as info
+    seen = {}
+    for s in subjects:
+        for it in s["items"]:
+            seen.setdefault(it["n"], []).append((s["entry"]["name"], it))
+    cross = {n: v for n, v in seen.items() if len(v) > 1}
+    for n, v in cross.items():
+        same = len({normalize(it["a"]) for _, it in v}) == 1
+        report.append(f"i same question in subjects {', '.join(name for name, _ in v)} "
+                      f"({'same' if same else 'DIFFERENT'} answers): {v[0][1]['q'][:90]}")
+
+    summary = (f"\nsubjects {len(subjects)}, rows read {totals['read']}, empty answers {totals['empty']}, "
+               f"exact duplicates merged {totals['merged']}, conflicts {len(all_conflicts)}, "
+               f"near-duplicates {totals['near']}, cross-subject duplicates {len(cross)}, "
+               f"shipped {sum(len(s['items']) for s in subjects)}")
     report.append(summary)
-    REPORT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    REPORT_FILE.write_text("\n".join(report), encoding="utf-8")
+    Path(args.report).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.report).write_text("\n".join(report), encoding="utf-8")
     print("\n".join(report))
-    print(f"\nreport: {REPORT_FILE}")
+    print(f"\nreport: {args.report}")
 
-    if conflicts and not args.allow_conflicts:
-        sys.exit("\nREFUSED: the same question has different answers (see CONFLICT lines). "
+    if all_conflicts and not args.allow_conflicts:
+        sys.exit("\nREFUSED: a question has different answers inside one subject (see CONFLICT lines). "
                  "Fix the Excel, or rerun with --allow-conflicts to ship the first answer.")
 
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.out).write_text(json.dumps(out, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-    print(f"wrote {args.out} ({Path(args.out).stat().st_size // 1024} KB, {len(items)} questions)")
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest_subjects, keep = [], {"manifest.json"}
+    for s in subjects:
+        e = s["entry"]
+        items = [{"id": it["id"], "q": it["q"], "a": it["a"], "n": it["n"]} for it in s["items"]]
+        version = content_hash(items)
+        name = f"{e['number']}.json"
+        doc = {"number": e["number"], "name": e["name"], "version": version, "count": len(items), "items": items}
+        (out_dir / name).write_text(json.dumps(doc, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        keep.add(name)
+        manifest_subjects.append({"number": e["number"], "name": e["name"], "count": len(items),
+                                  "file": name, "version": version})
+        print(f"wrote {out_dir / name} ({(out_dir / name).stat().st_size // 1024} KB, {len(items)} questions, '{e['name']}')")
+    manifest = {"version": content_hash([m["version"] + m["name"] for m in manifest_subjects]),
+                "subjects": manifest_subjects}
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    for p in out_dir.glob("*.json"):  # drop data of subjects that are no longer built
+        if p.name not in keep and re.fullmatch(r"\d+\.json", p.name):
+            p.unlink()
+            print(f"removed stale {p.name}")
+
+    if reg_changed or not reg_path.exists():
+        reg_path.parent.mkdir(parents=True, exist_ok=True)
+        reg_path.write_text(json.dumps(registry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(f"updated {reg_path} (edit 'name' there to rename a subject)")
 
 
 if __name__ == "__main__":

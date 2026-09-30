@@ -7,7 +7,7 @@
   const STORE_KEY = 'answer-app';
 
   // ---------- settings ----------
-  const settings = Object.assign({ mode: 'auto', autoRun: true, debug: false, installHintSeen: false }, load());
+  const settings = Object.assign({ mode: 'auto', autoRun: true, debug: false, installHintSeen: false, subject: '' }, load());
   function load() { try { return JSON.parse(localStorage.getItem(STORE_KEY) || '{}'); } catch { return {}; } }
   function save() { try { localStorage.setItem(STORE_KEY, JSON.stringify(settings)); } catch { /* private mode */ } }
 
@@ -24,18 +24,80 @@
   }
   document.querySelectorAll('#mode button').forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode)));
 
-  // ---------- dataset ----------
-  let index = null;
-  let datasetInfo = '';
-  async function loadQuestions() {
-    const res = await fetch('questions.json', { cache: 'no-cache' });
-    if (!res.ok) throw new Error('questions.json ' + res.status);
-    const data = await res.json();
-    index = M.buildIndex(data.items);
-    window.__items = data.items; // used by tests/golden_run.js
-    datasetInfo = `${data.count} سؤال، إصدار ${data.version}`;
-    $('#about').textContent = datasetInfo;
-    return data;
+  // ---------- dataset: one JSON per subject, only the selected subject is indexed ----------
+  let manifest = null;               // {version, subjects: [{number, name, count, file, version}]}
+  const subjectCache = new Map();    // number -> {number, name, items}
+  let index = null;                  // matcher index of the current selection
+  const subjectByNumber = (n) => manifest && manifest.subjects.find((s) => String(s.number) === String(n));
+  const multiSubject = () => !!manifest && manifest.subjects.length > 1;
+
+  async function loadManifest() {
+    const res = await fetch('data/manifest.json', { cache: 'no-cache' });
+    if (!res.ok) throw new Error('manifest ' + res.status);
+    return res.json();
+  }
+  async function loadSubject(s) {
+    if (subjectCache.has(s.number)) return subjectCache.get(s.number);
+    const res = await fetch(`data/${s.file}?v=${s.version}`);
+    if (!res.ok) throw new Error(`${s.file} ${res.status}`);
+    const doc = await res.json();
+    subjectCache.set(s.number, doc);
+    return doc;
+  }
+  // Build the index for the current choice: one subject, or all subjects merged ("كل المواد").
+  async function applySelection() {
+    const all = settings.subject === 'all';
+    const list = all ? manifest.subjects : [subjectByNumber(settings.subject)].filter(Boolean);
+    const docs = await Promise.all(list.map(loadSubject));
+    const items = docs.flatMap((d) => (all ? d.items.map((i) => ({ ...i, subject: d.name })) : d.items));
+    index = M.buildIndex(items);
+    window.__items = items; // used by tests/golden_run.js
+    $('#about').textContent = `${items.length} سؤال في ${docs.length} مادة، إصدار ${manifest.version}`;
+    return items.length;
+  }
+  function renderPicker() {
+    const sel = $('#subject');
+    sel.innerHTML = '<option value="" disabled>اختر المادة…</option>' +
+      manifest.subjects.map((s) => `<option value="${s.number}">${esc(s.name)} (${s.count})</option>`).join('') +
+      (manifest.subjects.length > 1 ? '<option value="all">كل المواد</option>' : '');
+    $('#subject-card').hidden = manifest.subjects.length < 2;
+  }
+  function syncPicker() {
+    $('#subject').value = settings.subject || '';
+    document.body.dataset.needSubject = settings.subject ? '' : '1';
+    $('#subject-hint').textContent = settings.subject ? '' : 'اختر المادة أولاً: البحث داخل مادة واحدة أدق وأسرع.';
+  }
+  async function setSubject(value) {
+    settings.subject = String(value); save();
+    syncPicker();
+    setStatus('جارٍ تحميل الأسئلة…');
+    try { await applySelection(); setStatus(''); } catch (e) { console.warn(e); setStatus('تعذر تحميل الأسئلة، تحقق من الاتصال'); }
+    runSearch();
+  }
+  $('#subject').addEventListener('change', (e) => setSubject(e.target.value));
+  // Idle prefetch of the other subjects so switching works offline later.
+  function prefetchOthers() {
+    const go = () => manifest.subjects.forEach((s) => { if (!subjectCache.has(s.number)) loadSubject(s).catch(() => {}); });
+    (window.requestIdleCallback || ((f) => setTimeout(f, 1500)))(go);
+  }
+  let ready = null; // resolves when the manifest and the current subject are loaded
+  async function bootData() {
+    manifest = await loadManifest();
+    renderPicker();
+    const want = new URLSearchParams(location.search).get('subject'); // deep link: ?subject=2 or ?subject=all
+    if (want && (want === 'all' || subjectByNumber(want))) settings.subject = want;
+    if (manifest.subjects.length === 1) settings.subject = String(manifest.subjects[0].number);
+    if (settings.subject !== 'all' && !subjectByNumber(settings.subject)) settings.subject = '';
+    save();
+    syncPicker();
+    if (settings.subject) { await applySelection(); setStatus(''); }
+    prefetchOthers();
+  }
+  async function ensureIndex() {
+    try { await ready; } catch { setStatus('تعذر تحميل الأسئلة، تحقق من الاتصال'); return false; }
+    if (!settings.subject) { $('#subject').focus(); return false; }
+    if (!index) { try { await applySelection(); } catch { setStatus('تعذر تحميل الأسئلة، تحقق من الاتصال'); return false; } }
+    return true;
   }
 
   // ---------- local OCR (Tesseract.js) ----------
@@ -137,13 +199,27 @@
   function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
   const TIER_NAME = { A: 'قراءة محلية', B: 'قراءة جوجل', C: 'تحقق ذكي' };
 
+  // Subject label shown when several subjects are searched together, plus the other subjects
+  // that contain the identical question and answer.
+  function subjectTag(c) {
+    if (!c.subject) return '';
+    const also = c.also && c.also.length ? ` · أيضاً في: ${c.also.map(esc).join('، ')}` : '';
+    return `<span class="subj">${esc(c.subject)}${also}</span>`;
+  }
   function renderConfident(best, via, debugText) {
     $('#result').innerHTML = `
       <article class="answer confident">
-        <span class="badge ok">✓ مؤكد · ${esc(via)}</span>
+        <span class="badge ok">✓ مؤكد · ${esc(via)}</span> ${subjectTag(best)}
         <p class="q">${esc(best.q)}</p>
         <p class="a">${esc(best.a)}</p>
       </article>` + debugBlock(debugText);
+  }
+  // Buttons under a result that is not green: widen the search to every subject (only when the
+  // user picked one subject) and open the typed search pre-filled with the text the OCR read.
+  function extraActions(canEdit) {
+    const canAll = settings.subject !== 'all' && multiSubject();
+    if (!canAll && !canEdit) return '';
+    return `<div class="actions">${canAll ? '<button class="secondary" data-act="all">🔎 ابحث في كل المواد</button>' : ''}${canEdit ? '<button class="secondary" data-act="edit">✎ عدّل النص وابحث</button>' : ''}</div>`;
   }
   // Verification could not run (offline / API down): show the most likely question with its answer
   // visible but clearly marked unverified, plus the runners-up to tap.
@@ -152,30 +228,53 @@
     const cards = rest.map(candCard).join('');
     $('#result').innerHTML = `
       <article class="answer unverified">
-        <span class="badge warn">الأرجح · غير مؤكد</span>
+        <span class="badge warn">الأرجح · غير مؤكد</span> ${subjectTag(top)}
         <p class="q">${esc(top.q)} <span class="score">${Math.round(top.score * 100)}%</span></p>
         <p class="a">${esc(top.a)}</p>
         <p class="src">${esc(note)}</p>
-      </article>${cards}${debugBlock(debugText)}`;
+      </article>${cards}${extraActions(true)}${debugBlock(debugText)}`;
     bindCards();
   }
   // Verifier rejected or unsure: answers stay hidden until the user taps the matching question.
   function renderCandidates(cands, debugText, note) {
     $('#result').innerHTML = `<div class="answer unverified"><span class="badge warn">غير مؤكد</span>
-      <p class="q">${esc(note || 'لم أتأكد من السؤال. اضغط على السؤال المطابق لعرض إجابته، أو قص السؤال وأعد المحاولة.')}</p></div>${cands.map(candCard).join('')}${debugBlock(debugText)}`;
+      <p class="q">${esc(note || 'لم أتأكد من السؤال. اضغط على السؤال المطابق لعرض إجابته، أو قص السؤال وأعد المحاولة.')}</p></div>${cands.map(candCard).join('')}${extraActions(true)}${debugBlock(debugText)}`;
     bindCards();
   }
   function candCard(c) {
     return `<article class="cand" data-id="${c.id}">
-        <p class="q">${esc(c.q)} <span class="score">${Math.round(c.score * 100)}%</span></p>
+        <p class="q">${esc(c.q)} <span class="score">${Math.round(c.score * 100)}%</span> ${subjectTag(c)}</p>
         <p class="a">${esc(c.a)}</p>
       </article>`;
   }
-  function bindCards() { document.querySelectorAll('.cand').forEach((el) => el.addEventListener('click', () => el.classList.toggle('open'))); }
-  function renderNotice(text, isError, debugText) {
-    $('#result').innerHTML = `<p class="notice${isError ? ' error' : ''}">${esc(text)}</p>${debugBlock(debugText)}`;
+  function bindCards() { document.querySelectorAll('.cand').forEach((el) => { el.onclick = () => el.classList.toggle('open'); }); }
+  function renderNotice(text, isError, debugText, withActions) {
+    $('#result').innerHTML = `<p class="notice${isError ? ' error' : ''}">${esc(text)}</p>${withActions ? extraActions(!!(debugText && debugText.trim())) : ''}${debugBlock(debugText)}`;
   }
   function debugBlock(t) { return settings.debug && t ? `<pre class="debug">${esc(t)}</pre>` : ''; }
+
+  // The action buttons are rendered as HTML, so one delegated handler serves every result.
+  $('#result').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-act]');
+    if (!b) return;
+    if (b.dataset.act === 'all') searchAllSubjects();
+    if (b.dataset.act === 'edit') editTextAndSearch();
+  });
+  let lastRun = null; // {blob, texts: {A, B}} of the latest photo, reused when widening to all subjects
+  async function searchAllSubjects() {
+    await setSubject('all');
+    if (lastRun && !$('#view-work').hidden) startRun(lastRun.blob, { reuse: lastRun.texts });
+  }
+  function editTextAndSearch() {
+    const t = (lastRun && (lastRun.texts.B || lastRun.texts.A) || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+    if (run) run.cancel();
+    show('home');
+    const input = $('#q-input');
+    input.value = t;
+    runSearch(true);
+    input.focus();
+    input.scrollIntoView({ block: 'center' });
+  }
 
   // ---------- matching ----------
   function analyse(text) {
@@ -190,32 +289,38 @@
   // the photo and pick a candidate with high confidence, that candidate to be in the OCR top 3, and the
   // verifier's own transcription of the photo to match that same question.
   let run = null; // current run context
-  async function startRun(blob) {
+  // opts.reuse = {A?, B?}: OCR text already read for this photo (used when widening to all subjects);
+  // the OCR engines are skipped and the same text is ranked against the new index, then verified again.
+  async function startRun(blob, opts) {
+    opts = opts || {};
     if (run) run.cancel();
     const mode = settings.mode;
     const online = navigator.onLine;
     const ctx = { done: false, aborters: [], results: {}, verifyStarted: false, cancel() { this.done = true; this.aborters.forEach((a) => a.abort()); } };
     run = ctx;
     currentBlob = blob;
+    if (!opts.reuse) lastRun = { blob, texts: {} };
     $('#view-work').dataset.done = '';
     $('#result').innerHTML = '';
     ['A', 'B', 'C'].forEach((t) => chip(t, 'idle'));
     startTimer();
 
-    const useA = mode !== 'google';
-    const useB = mode !== 'local' && online;
+    const reuse = opts.reuse || null;
+    const useA = !reuse && mode !== 'google';
+    const useB = !reuse && mode !== 'local' && online;
     chip('A', useA ? 'running' : 'skip');
     chip('B', useB ? 'running' : (online ? 'skip' : 'fail'));
     chip('C', online ? 'idle' : 'skip');
     const markDone = () => { $('#view-work').dataset.done = '1'; };
-    if (!useA && !useB) { stopTimer(); renderNotice('لا يوجد اتصال بالإنترنت. اختر وضع "محلي" للقراءة بدون إنترنت.', true); markDone(); return; }
+    if (!reuse && !useA && !useB) { stopTimer(); renderNotice('لا يوجد اتصال بالإنترنت. اختر وضع "محلي" للقراءة بدون إنترنت.', true); markDone(); return; }
 
-    const pending = { A: useA, B: useB };
+    const pending = { A: useA || (!!reuse && reuse.A != null), B: useB || (!!reuse && reuse.B != null) };
     const finish = (fn) => { if (ctx.done) return; ctx.cancel(); stopTimer(); fn(); markDone(); };
 
     function onOcr(tier, text) {
       if (ctx.done) return;
       pending[tier] = false;
+      if (lastRun) lastRun.texts[tier] = text;
       const r = analyse(text);
       ctx.results[tier] = { text, r };
       chip(tier, r.decision.status === 'confident' ? 'done' : r.decision.status === 'none' ? 'fail' : 'partial');
@@ -251,8 +356,8 @@
       if (!m.list.length || m.list[0].score < C.thresholds.min) {
         if (stillWaiting) return; // the other engine may still read it
         return finish(() => m.text.trim()
-          ? renderNotice('لم أجد السؤال، حاول تصوير السؤال أقرب وبوضوح.', false, m.text)
-          : renderNotice('تعذرت قراءة الصورة. حاول التصوير في إضاءة أفضل.', true));
+          ? renderNotice(settings.subject === 'all' ? 'لم أجد السؤال، حاول تصوير السؤال أقرب وبوضوح.' : 'لم أجد السؤال في هذه المادة. جرّب كل المواد أو صوّر السؤال أقرب.', false, m.text, true)
+          : renderNotice('تعذرت قراءة الصورة. حاول التصوير في إضاءة أفضل.', true, '', true));
       }
       if (m.multi) return finish(() => renderCandidates(m.list.slice(0, 3), m.text, 'الصورة تحتوي على أكثر من سؤال. قص السؤال المطلوب وأعد المحاولة، أو اضغط على السؤال المطابق.'));
       if (!online) return finish(() => renderLikely(m.list.slice(0, 3), 'لا يوجد إنترنت للتحقق من الصورة. تأكد بنفسك أن السؤال مطابق.', m.text));
@@ -272,14 +377,20 @@
           transcriptionOk = !!tr.length && tr[0].id === hit.id && tr[0].score >= C.verify.transcriptionMinScore;
         }
         const debug = m.text + (v.photo_question ? '\n--- verifier read ---\n' + v.photo_question : '') + (v.reason ? '\n--- ' + v.reason : '');
-        if (hit && v.confidence === 'high' && inTop3 && transcriptionOk) {
+        // the same question with a different answer in another subject can never be green
+        const clash = hit && M.hasConflictingTwin(hit, m.list);
+        if (hit && v.confidence === 'high' && inTop3 && transcriptionOk && !clash) {
           chip('C', 'done');
           finish(() => renderConfident(hit, 'تم التحقق من الصورة', debug));
         } else {
           chip('C', 'fail');
-          finish(() => renderCandidates(m.list.slice(0, 3), debug, hit
-            ? 'التحقق لم يؤكد التطابق. اضغط على السؤال المطابق لعرض إجابته، أو قص السؤال وأعد المحاولة.'
-            : undefined));
+          finish(() => renderCandidates(m.list.slice(0, 3), debug, clash
+            ? 'هذا السؤال موجود في أكثر من مادة بإجابات مختلفة. اختر المادة الصحيحة من القائمة:'
+            : hit
+              ? 'التحقق لم يؤكد التطابق. اضغط على السؤال المطابق لعرض إجابته، أو قص السؤال وأعد المحاولة.'
+              : settings.subject !== 'all' && multiSubject()
+                ? 'الصورة لا تطابق أسئلة هذه المادة على الأرجح. جرّب "ابحث في كل المواد"، أو اضغط على أقرب سؤال:'
+                : undefined));
         }
       } catch (err) {
         if (ctx.done) return;
@@ -289,6 +400,13 @@
       }
     }
 
+    if (reuse) {
+      // text already read: rank it against the new index, then verify against the photo again
+      if (reuse.A != null) onOcr('A', reuse.A);
+      if (reuse.B != null) onOcr('B', reuse.B);
+      if (!ctx.done && !ctx.verifyStarted) maybeVerify();
+      return;
+    }
     if (useA) localOcr(blob).then((t) => onOcr('A', t), (e) => onOcrFail('A', e));
     if (useB) {
       const t = withTimeout(C.cloudOcrTimeoutMs); ctx.aborters.push(t);
@@ -299,7 +417,7 @@
   // ---------- capture ----------
   async function handleFile(file) {
     if (!file) return;
-    if (!index) { setStatus('جارٍ تحميل الأسئلة…'); try { await loadQuestions(); } catch { setStatus('تعذر تحميل الأسئلة'); return; } }
+    if (!(await ensureIndex())) return;
     show('work');
     $('#view-work').dataset.done = '';
     $('#result').innerHTML = '<p class="notice">جارٍ تجهيز الصورة…</p>';
@@ -364,6 +482,50 @@
     startRun(await canvasToBlob(cv));
   });
 
+  // ---------- typed search (local, instant, works offline) ----------
+  const S = Object.assign({ minChars: 2, debounceMs: 150, maxResults: 8 }, C.search);
+  let searchTimer = null;
+  function runSearch(immediate, enterPressed) {
+    clearTimeout(searchTimer);
+    const go = async () => {
+      const q = $('#q-input').value;
+      $('#q-clear').hidden = !q;
+      const box = $('#search-results');
+      if (M.normalize(q).replace(/ /g, '').length < S.minChars) { box.innerHTML = ''; box.dataset.q = ''; return; }
+      if (!(await ensureIndex())) { box.innerHTML = ''; box.dataset.q = ''; return; }
+      renderSearch(M.search(index, q, S.maxResults, { prefix: !enterPressed, minChars: S.minChars }), q);
+      box.dataset.q = q; // marks which query the visible results belong to (used by tests)
+    };
+    if (immediate) go(); else searchTimer = setTimeout(go, S.debounceMs);
+  }
+  function searchCard(c, q, open) {
+    const html = M.highlight(c.q, q).map((p) => (p.hit ? `<mark>${esc(p.text)}</mark>` : esc(p.text))).join('');
+    return `<article class="cand${open ? ' open' : ''}" data-id="${c.id}">
+        <p class="q">${html} ${subjectTag(c)}</p>
+        <p class="a">${esc(c.a)}</p>
+      </article>`;
+  }
+  function searchActions() {
+    return settings.subject !== 'all' && multiSubject()
+      ? '<div class="actions"><button class="secondary" data-act="search-all">🔎 ابحث في كل المواد</button></div>' : '';
+  }
+  // "✓ مطابق" needs the same strict rule as a photo OCR read (score, lead, no clash); otherwise the
+  // list is just suggestions. The top card is open unless the same question exists with different answers.
+  function renderSearch(results, q) {
+    const box = $('#search-results');
+    if (!results.length) { box.innerHTML = '<p class="notice">لا توجد نتائج مطابقة. جرّب كلمات أخرى.</p>' + searchActions(); return; }
+    const clash = M.hasConflictingTwin(results[0], results);
+    const sure = M.decide(results, C.thresholds).status === 'confident' && !clash;
+    box.innerHTML = `<div class="search-head">${sure ? '<span class="badge ok">✓ مطابق</span>' : '<span class="badge neutral">نتائج مقترحة</span>'}
+      ${clash ? '<p class="src">هذا السؤال موجود في أكثر من مادة بإجابات مختلفة، تأكد من المادة.</p>' : ''}</div>` +
+      results.map((c, i) => searchCard(c, q, !clash && i === 0)).join('') + searchActions();
+    bindCards();
+  }
+  $('#q-input').addEventListener('input', () => runSearch());
+  $('#q-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); runSearch(true, true); e.target.blur(); } });
+  $('#q-clear').addEventListener('click', () => { $('#q-input').value = ''; runSearch(true); $('#q-input').focus(); });
+  $('#search-results').addEventListener('click', (e) => { if (e.target.closest('[data-act="search-all"]')) setSubject('all'); });
+
   // ---------- settings dialog ----------
   $('#btn-settings').addEventListener('click', () => { $('#opt-auto-run').checked = settings.autoRun; $('#opt-debug').checked = settings.debug; $('#settings').showModal(); });
   $('#btn-close-settings').addEventListener('click', () => $('#settings').close());
@@ -387,7 +549,8 @@
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
   setMode(settings.mode);
   installHint();
-  loadQuestions().then(() => setStatus(''), () => setStatus('تعذر تحميل الأسئلة، تحقق من الاتصال'));
+  ready = bootData();
+  ready.catch((e) => { console.warn(e); setStatus('تعذر تحميل الأسئلة، تحقق من الاتصال'); });
   window.addEventListener('load', () => { if (settings.mode !== 'google') warmLocalOcr(); });
   window.addEventListener('online', () => { if (settings.mode !== 'local') setStatus(''); });
   window.addEventListener('offline', () => setStatus(settings.mode === 'google' ? 'لا يوجد إنترنت: وضع جوجل لن يعمل' : ''));
