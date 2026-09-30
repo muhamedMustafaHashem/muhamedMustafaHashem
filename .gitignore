@@ -1,0 +1,15 @@
+node_modules/
+worker/.wrangler/
+worker/.dev.vars
+# your Excel sheets and the build report (answers may be sensitive)
+data/source/*
+!data/source/.gitkeep
+data/build_report.txt
+# golden photos are large; keep labels only
+tests/golden/*.jpg
+tests/golden/*.jpeg
+tests/golden/*.png
+tests/golden/results*.json
+.DS_Store
+__pycache__/
+*.pyc

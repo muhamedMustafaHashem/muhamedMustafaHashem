@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>إجابة بالصورة</title>
+  <meta name="description" content="صوّر السؤال واحصل على الإجابة الصحيحة فوراً">
+  <meta name="theme-color" content="#105c48">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="إجابة">
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <h1>إجابة بالصورة</h1>
+    <button id="btn-settings" class="icon-btn" aria-label="الإعدادات">⚙︎</button>
+  </header>
+
+  <main id="view-home" class="view">
+    <section class="card">
+      <label class="mode-label">طريقة قراءة النص</label>
+      <div class="segmented" id="mode" role="radiogroup">
+        <button data-mode="auto" role="radio">تلقائي<small>الأسرع</small></button>
+        <button data-mode="local" role="radio">محلي<small>بدون إنترنت</small></button>
+        <button data-mode="google" role="radio">جوجل<small>يحتاج إنترنت</small></button>
+      </div>
+      <p id="mode-hint" class="hint"></p>
+    </section>
+
+    <label class="capture" for="file">
+      <input id="file" type="file" accept="image/*" capture="environment" hidden>
+      <span class="cam">📷</span>
+      <span>التقط صورة للسؤال</span>
+    </label>
+    <button id="btn-gallery" class="link">أو اختر صورة من المعرض</button>
+
+    <p id="status-line" class="status"></p>
+    <p id="install-hint" class="install" hidden></p>
+  </main>
+
+  <main id="view-work" class="view" hidden>
+    <div class="preview-wrap">
+      <img id="preview" alt="">
+      <div id="crop-box" class="crop-box" hidden><div class="handle"></div></div>
+    </div>
+    <div id="progress" class="progress">
+      <span class="chip" data-tier="A">محلي</span>
+      <span class="chip" data-tier="B">جوجل</span>
+      <span class="chip" data-tier="C">تحقق</span>
+      <span id="elapsed" class="elapsed">0.0 ث</span>
+    </div>
+
+    <section id="result"></section>
+
+    <div class="actions">
+      <button id="btn-crop" class="secondary">✂︎ قص السؤال وأعد المحاولة</button>
+      <button id="btn-crop-go" class="primary" hidden>ابحث في الجزء المحدد</button>
+      <button id="btn-again" class="primary">📷 صورة جديدة</button>
+    </div>
+  </main>
+
+  <dialog id="settings">
+    <h2>الإعدادات</h2>
+    <label class="row"><span>البحث تلقائياً بعد التصوير</span><input type="checkbox" id="opt-auto-run" checked></label>
+    <label class="row"><span>عرض النص المقروء (للتشخيص)</span><input type="checkbox" id="opt-debug"></label>
+    <p class="small" id="about"></p>
+    <button id="btn-close-settings" class="primary">إغلاق</button>
+  </dialog>
+
+  <script src="config.js"></script>
+  <script src="matcher.js"></script>
+  <script src="vendor/tesseract/tesseract.min.js" defer></script>
+  <script src="app.js" defer></script>
+</body>
+</html>

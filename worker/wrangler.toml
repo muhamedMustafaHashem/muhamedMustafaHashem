@@ -1,0 +1,28 @@
+name = "answer-app"
+main = "index.js"
+compatibility_date = "2025-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Static PWA files. Requests under /api/* reach the Worker first; everything else is served as a file.
+[assets]
+directory = "../public"
+run_worker_first = ["/api/*"]
+not_found_handling = "404-page"
+
+[vars]
+# Model used by /api/verify. Cheaper/faster alternative: "claude-haiku-4-5"
+CLAUDE_MODEL = "claude-opus-5-5"
+CLAUDE_EFFORT = "low"
+# Comma-separated origins allowed to call the API from another domain. Empty = same origin only.
+ALLOWED_ORIGINS = ""
+
+# Per-IP rate limit: 30 requests per 60 s (each photo uses at most 2).
+[[ratelimits]]
+name = "RATE_LIMITER"
+namespace_id = "1001"
+simple = { limit = 30, period = 60 }
+
+# Secrets (never in this file):
+#   npx wrangler secret put GOOGLE_VISION_KEY
+#   npx wrangler secret put ANTHROPIC_API_KEY
+#   npx wrangler secret put APP_TOKEN        # same value as appToken in public/config.js
