@@ -10,9 +10,15 @@ run_worker_first = ["/api/*"]
 not_found_handling = "404-page"
 
 [vars]
-# Model used by /api/verify. Cheaper/faster alternative: "claude-haiku-4-5"
-CLAUDE_MODEL = "claude-opus-5-5"
-CLAUDE_EFFORT = "medium"   # "low" is a bit faster; keep "medium" for accuracy
+# Gemini model used for reading the photo and verifying the question. A cheap, fast Flash-Lite model by
+# default. Model names change often: after deploying run  curl -X POST -H "x-app-token: TOKEN" https://<app>/api/selftest
+# and, if the name is rejected or you want more accuracy, set another current Gemini Flash model here.
+GEMINI_MODEL = "gemini-3.1-flash-lite"
+# "gemini" reads the photo's text with the same model (one key, cheapest). "vision" uses Google Cloud Vision instead
+# (needs GOOGLE_VISION_KEY, about USD 1.50 per 1,000 photos after the first 1,000 each month).
+OCR_PROVIDER = "gemini"
+# Thinking level for Gemini 3.x models ("low" is fastest and cheapest here; Gemini 2.x models use a zero budget).
+GEMINI_THINKING = "low"
 # Comma-separated origins allowed to call the API from another domain. Empty = same origin only.
 ALLOWED_ORIGINS = ""
 
@@ -23,6 +29,6 @@ namespace_id = "1001"
 simple = { limit = 30, period = 60 }
 
 # Secrets (never in this file):
-#   npx wrangler secret put GOOGLE_VISION_KEY
-#   npx wrangler secret put ANTHROPIC_API_KEY
+#   npx wrangler secret put GEMINI_API_KEY   # free key from https://aistudio.google.com/apikey
 #   npx wrangler secret put APP_TOKEN        # same value as appToken in public/config.js
+#   (only with OCR_PROVIDER = "vision":  npx wrangler secret put GOOGLE_VISION_KEY)

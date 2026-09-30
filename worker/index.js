@@ -1,27 +1,38 @@
-/* Cloudflare Worker: API for the photo-answer app.
- *   POST /api/ocr     image (multipart "image")                 -> { text }
- *   POST /api/verify  image + candidates JSON + ocr text        -> { match_id, confidence, reason }
- *   GET  /api/health                                            -> { ok, model }
+/* Cloudflare Worker: API for the photo-answer app. One Google Gemini key does both jobs.
+ *   POST /api/ocr      image (multipart "image")                   -> { text }
+ *   POST /api/verify   image + candidates JSON + ocr text          -> { match_id, confidence, photo_question, reason, usage, cost_usd }
+ *   POST /api/selftest                                            -> checks the key and the model name with a tiny request
+ *   GET  /api/health                                              -> { ok, model, ocr }
  * Static files in ../public are served by Workers Static Assets (see wrangler.toml).
- * Secrets: GOOGLE_VISION_KEY, ANTHROPIC_API_KEY, APP_TOKEN (wrangler secret put ...). */
-import Anthropic from '@anthropic-ai/sdk';
+ * Secrets:  GEMINI_API_KEY, APP_TOKEN            (wrangler secret put ...)
+ * Optional: GOOGLE_VISION_KEY when OCR_PROVIDER = "vision" (Cloud Vision instead of Gemini for reading text). */
 
+const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/';
 const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
-const DEFAULT_MODEL = 'claude-opus-5-5';
+// A fast, cheap, GA Flash-Lite model. Model names change often: set GEMINI_MODEL in wrangler.toml to use another
+// (for example a bigger Flash model for more accuracy) and run POST /api/selftest to confirm the name works.
+const DEFAULT_MODEL = 'gemini-3.1-flash-lite';
+// USD per million tokens [input, output] for the cost estimate. A guide only (prices change);
+// override with PRICE_IN / PRICE_OUT in wrangler.toml.
+const PRICES = [
+  [/^gemini-3\.1-flash-lite/, [0.25, 1.5]],
+  [/^gemini-2\.5-flash-lite/, [0.10, 0.40]],
+  [/^gemini-2\.5-flash/, [0.30, 2.50]],
+];
 
 const VERIFY_SCHEMA = {
-  type: 'object',
-  additionalProperties: false,
-  required: ['photo_question', 'match_id', 'confidence', 'reason'],
+  type: 'OBJECT',
   properties: {
-    photo_question: { type: 'string', description: 'the question text exactly as written in the photo, Arabic, without the answer options; empty string if unreadable' },
-    match_id: { type: ['integer', 'null'], description: 'id of the candidate that is the same question as in the photo, or null' },
-    confidence: { type: 'string', enum: ['high', 'low'] },
-    reason: { type: 'string', description: 'one short sentence' },
+    photo_question: { type: 'STRING', description: 'the question text exactly as written in the photo, Arabic, without the answer options; empty string if unreadable' },
+    match_id: { type: 'INTEGER', nullable: true, description: 'id of the candidate that is the same question as in the photo, or null' },
+    confidence: { type: 'STRING', enum: ['high', 'low'] },
+    reason: { type: 'STRING', description: 'one short sentence' },
   },
+  required: ['photo_question', 'match_id', 'confidence', 'reason'],
+  propertyOrdering: ['photo_question', 'match_id', 'confidence', 'reason'],
 };
 
-const SYSTEM_PROMPT = `You verify which question from a closed list is the one shown in a photo.
+const VERIFY_PROMPT = `You verify which question from a closed list is the one shown in a photo.
 The photo shows an Arabic exam question, possibly with answer options, numbering, neighbouring questions or glare.
 You receive a numbered list of candidate questions (id + text) and, as a hint only, the raw OCR text.
 
@@ -30,7 +41,13 @@ Rules:
 - Return match_id only when a candidate asks the same question as the photo (same meaning, same subject). Small OCR-style differences in spelling, diacritics, punctuation or numbering do not matter.
 - Two candidates that differ in a key word (e.g. "أطول" vs "أقصر", "العالم" vs "أفريقيا", a year or a number) are different questions; pick the one whose key words match the photo.
 - If the photo contains several questions, answer for the one that fills most of the image or is most prominent.
-- confidence "high" only when you are certain the chosen candidate is the same question. If no candidate matches, or you cannot read the photo, return match_id null with confidence "low".`;
+- confidence "high" only when you are certain the chosen candidate is the same question. If no candidate matches, or you cannot read the photo, return match_id null with confidence "low".
+
+Reply with one JSON object and nothing else: {"photo_question": string, "match_id": integer or null, "confidence": "high" or "low", "reason": string}.`;
+
+const OCR_PROMPT = `Transcribe all the text in this image exactly as written. The text is Arabic (right to left) and may contain English letters, digits and symbols. Keep each line of the image on its own line. Output only the text, with no commentary.`;
+
+class HttpError extends Error { constructor(status, message) { super(message); this.status = status; } }
 
 function json(data, status = 200, extra = {}) {
   return new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json; charset=utf-8', ...extra } });
@@ -70,9 +87,7 @@ async function readImage(req) {
   return { bytes, type, fields };
 }
 
-class HttpError extends Error { constructor(status, message) { super(message); this.status = status; } }
-
-async function checkAccess(req, env, ctx) {
+async function checkAccess(req, env) {
   if (env.APP_TOKEN && req.headers.get('x-app-token') !== env.APP_TOKEN) throw new HttpError(401, 'bad app token');
   if (env.RATE_LIMITER) {
     const ip = req.headers.get('cf-connecting-ip') || 'unknown';
@@ -81,16 +96,83 @@ async function checkAccess(req, env, ctx) {
   }
 }
 
-// ---------- Google Vision OCR ----------
-async function ocr(bytes, env) {
+// ---------- Gemini ----------
+const modelOf = (env) => env.GEMINI_MODEL || DEFAULT_MODEL;
+
+// Gemini 2.x switches thinking off with a zero budget; Gemini 3.x takes a level. Thinking tokens are billed
+// as output, and reading one question needs none, so keep it as small as the model allows.
+function thinkingFor(model, env) {
+  if (env.GEMINI_THINKING === 'default') return null;
+  if (/^gemini-2\./.test(model)) return { thinkingBudget: 0 };
+  return { thinkingLevel: env.GEMINI_THINKING || 'low' };
+}
+
+/** One generateContent call. If Gemini rejects an optional setting (400), retry with fewer settings:
+ *  drop the thinking config, then the response schema, then the JSON mime type. */
+async function gemini(env, { system, parts, schema, json: wantJson, maxOutputTokens }) {
+  if (!env.GEMINI_API_KEY) throw new HttpError(503, 'GEMINI_API_KEY not configured');
+  const model = modelOf(env);
+  const variants = [
+    { thinking: true, schema: !!schema, mime: wantJson },
+    { thinking: false, schema: !!schema, mime: wantJson },
+    { thinking: false, schema: false, mime: wantJson },
+    { thinking: false, schema: false, mime: false },
+  ].filter((v, i, a) => i === a.findIndex((w) => w.thinking === v.thinking && w.schema === v.schema && w.mime === v.mime));
+  let lastError = '';
+  for (const v of variants) {
+    const generationConfig = { temperature: 0, maxOutputTokens };
+    if (v.mime) generationConfig.responseMimeType = 'application/json';
+    if (v.schema) generationConfig.responseSchema = schema;
+    const th = v.thinking ? thinkingFor(model, env) : null;
+    if (th) generationConfig.thinkingConfig = th;
+    const body = { contents: [{ role: 'user', parts }], generationConfig };
+    if (system) body.systemInstruction = { parts: [{ text: system }] };
+    const res = await fetch(`${GEMINI_URL}${encodeURIComponent(model)}:generateContent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY },
+      body: JSON.stringify(body),
+    });
+    if (res.status === 400) { lastError = (await res.text()).slice(0, 300); continue; }
+    if (res.status === 404) throw new HttpError(502, `model "${model}" not found: set GEMINI_MODEL in wrangler.toml to a current Gemini Flash model name`);
+    if (!res.ok) throw new HttpError(502, `gemini ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    const data = await res.json();
+    const cand = data.candidates && data.candidates[0];
+    const text = ((cand && cand.content && cand.content.parts) || []).filter((p) => !p.thought).map((p) => p.text || '').join('');
+    const blocked = (data.promptFeedback && data.promptFeedback.blockReason) || (cand && /SAFETY|RECITATION|PROHIBITED/.test(cand.finishReason || '') ? cand.finishReason : '');
+    const u = data.usageMetadata || {};
+    return { text, blocked, model, usage: { input_tokens: u.promptTokenCount || 0, output_tokens: (u.candidatesTokenCount || 0) + (u.thoughtsTokenCount || 0) } };
+  }
+  throw new HttpError(502, `gemini rejected the request: ${lastError}`);
+}
+
+function costOf(env, model, usage) {
+  let price = PRICES.find(([re]) => re.test(model));
+  price = price ? price[1] : null;
+  if (env.PRICE_IN && env.PRICE_OUT) price = [Number(env.PRICE_IN), Number(env.PRICE_OUT)];
+  if (!price || !usage) return null;
+  return Math.round(usage.input_tokens * price[0] + usage.output_tokens * price[1]) / 1e6; // USD
+}
+
+// The reply is JSON; take the first {...} block in case the model added a word around it.
+function parseReply(text) {
+  try { return JSON.parse(text); } catch { /* fall through */ }
+  const m = /\{[\s\S]*\}/.exec(text);
+  if (m) { try { return JSON.parse(m[0]); } catch { /* fall through */ } }
+  return null;
+}
+
+async function ocrGemini(bytes, type, env) {
+  const r = await gemini(env, {
+    parts: [{ inline_data: { mime_type: type, data: bytesToBase64(bytes) } }, { text: OCR_PROMPT }],
+    json: false, maxOutputTokens: 1024,
+  });
+  return { text: r.blocked ? '' : r.text.trim(), usage: r.usage, cost_usd: costOf(env, r.model, r.usage) };
+}
+
+// Optional alternative reader (set OCR_PROVIDER = "vision"): Google Cloud Vision.
+async function ocrVision(bytes, env) {
   if (!env.GOOGLE_VISION_KEY) throw new HttpError(503, 'GOOGLE_VISION_KEY not configured');
-  const body = {
-    requests: [{
-      image: { content: bytesToBase64(bytes) },
-      features: [{ type: 'DOCUMENT_TEXT_DETECTION' }],
-      imageContext: { languageHints: ['ar'] },
-    }],
-  };
+  const body = { requests: [{ image: { content: bytesToBase64(bytes) }, features: [{ type: 'DOCUMENT_TEXT_DETECTION' }], imageContext: { languageHints: ['ar'] } }] };
   const res = await fetch(`https://vision.googleapis.com/v1/images:annotate?key=${env.GOOGLE_VISION_KEY}`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
   });
@@ -98,35 +180,21 @@ async function ocr(bytes, env) {
   const data = await res.json();
   const r = (data.responses && data.responses[0]) || {};
   if (r.error) throw new HttpError(502, `vision: ${r.error.message}`);
-  return (r.fullTextAnnotation && r.fullTextAnnotation.text) || '';
+  return { text: (r.fullTextAnnotation && r.fullTextAnnotation.text) || '', usage: null, cost_usd: null };
 }
 
-// ---------- Claude verifier ----------
-async function verifyWithClaude(bytes, type, candidates, ocrText, env) {
-  if (!env.ANTHROPIC_API_KEY) throw new HttpError(503, 'ANTHROPIC_API_KEY not configured');
-  const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY, maxRetries: 1, timeout: 20_000 });
+async function verifyWithGemini(bytes, type, candidates, ocrText, env) {
   const list = candidates.map((c) => `${c.id}. ${c.q}`).join('\n');
   const userText = `Candidates:\n${list}\n\nOCR hint (may contain errors):\n${(ocrText || '').slice(0, 1500)}\n\nWhich candidate id is the question in the photo?`;
-  const model = env.CLAUDE_MODEL || DEFAULT_MODEL;
-  const response = await client.beta.messages.create({
-    model,
-    max_tokens: 600,
-    system: SYSTEM_PROMPT,
-    output_config: { effort: env.CLAUDE_EFFORT || 'medium', format: { type: 'json_schema', schema: VERIFY_SCHEMA } },
-    betas: ['server-side-fallback-2026-07-01'],
-    fallbacks: 'default',
-    messages: [{
-      role: 'user',
-      content: [
-        { type: 'image', source: { type: 'base64', media_type: type, data: bytesToBase64(bytes) } },
-        { type: 'text', text: userText },
-      ],
-    }],
+  const r = await gemini(env, {
+    system: VERIFY_PROMPT,
+    parts: [{ inline_data: { mime_type: type, data: bytesToBase64(bytes) } }, { text: userText }],
+    schema: VERIFY_SCHEMA, json: true, maxOutputTokens: 400,
   });
-  if (response.stop_reason === 'refusal') return { match_id: null, confidence: 'low', photo_question: '', reason: 'refused' };
-  const text = response.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
-  let parsed;
-  try { parsed = JSON.parse(text); } catch { return { match_id: null, confidence: 'low', photo_question: '', reason: 'unparseable' }; }
+  const extra = { model: r.model, usage: r.usage, cost_usd: costOf(env, r.model, r.usage) };
+  if (r.blocked) return { match_id: null, confidence: 'low', photo_question: '', reason: 'blocked: ' + r.blocked, ...extra };
+  const parsed = parseReply(r.text);
+  if (!parsed) return { match_id: null, confidence: 'low', photo_question: '', reason: 'unparseable', ...extra };
   const ids = new Set(candidates.map((c) => c.id));
   const matchId = Number.isInteger(parsed.match_id) && ids.has(parsed.match_id) ? parsed.match_id : null;
   return {
@@ -134,25 +202,27 @@ async function verifyWithClaude(bytes, type, candidates, ocrText, env) {
     confidence: matchId && parsed.confidence === 'high' ? 'high' : 'low',
     photo_question: String(parsed.photo_question || '').slice(0, 500),
     reason: String(parsed.reason || '').slice(0, 200),
-    model: response.model,
+    ...extra,
   };
 }
 
 export default {
-  async fetch(req, env, ctx) {
+  async fetch(req, env) {
     const url = new URL(req.url);
     const cors = corsHeaders(env, req);
     if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
     try {
-      if (url.pathname === '/api/health') return json({ ok: true, model: env.CLAUDE_MODEL || DEFAULT_MODEL, vision: !!env.GOOGLE_VISION_KEY, claude: !!env.ANTHROPIC_API_KEY }, 200, cors);
+      if (url.pathname === '/api/health') {
+        return json({ ok: true, model: modelOf(env), ocr: env.OCR_PROVIDER || 'gemini', gemini: !!env.GEMINI_API_KEY }, 200, cors);
+      }
       if (req.method !== 'POST') throw new HttpError(405, 'method not allowed');
-      await checkAccess(req, env, ctx);
+      await checkAccess(req, env);
 
       if (url.pathname === '/api/ocr') {
-        const { bytes } = await readImage(req);
+        const { bytes, type } = await readImage(req);
         const t0 = Date.now();
-        const text = await ocr(bytes, env);
-        return json({ text, ms: Date.now() - t0 }, 200, cors);
+        const out = env.OCR_PROVIDER === 'vision' ? await ocrVision(bytes, env) : await ocrGemini(bytes, type, env);
+        return json({ ...out, ms: Date.now() - t0 }, 200, cors);
       }
       if (url.pathname === '/api/verify') {
         const { bytes, type, fields } = await readImage(req);
@@ -161,8 +231,13 @@ export default {
         candidates = candidates.filter((c) => c && Number.isInteger(c.id) && typeof c.q === 'string').slice(0, 10);
         if (!candidates.length) throw new HttpError(400, 'no candidates');
         const t0 = Date.now();
-        const result = await verifyWithClaude(bytes, type, candidates, fields.ocr, env);
+        const result = await verifyWithGemini(bytes, type, candidates, fields.ocr, env);
         return json({ ...result, ms: Date.now() - t0 }, 200, cors);
+      }
+      if (url.pathname === '/api/selftest') { // a tiny text request: proves the key works and the model name exists
+        const t0 = Date.now();
+        const r = await gemini(env, { parts: [{ text: 'Reply with the JSON {"ok": true} and nothing else.' }], json: true, maxOutputTokens: 50 });
+        return json({ ok: true, model: r.model, reply: r.text.slice(0, 80), usage: r.usage, ms: Date.now() - t0 }, 200, cors);
       }
       throw new HttpError(404, 'not found');
     } catch (err) {

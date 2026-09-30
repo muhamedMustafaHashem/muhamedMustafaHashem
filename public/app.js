@@ -194,7 +194,7 @@
   }
   async function verify(blob, candidates, ocrText, signal) {
     const fd = new FormData();
-    fd.append('image', blob, 'q.jpg');
+    fd.append('image', await resizeBlob(blob, C.verifyImageSide || 1280), 'q.jpg');
     fd.append('candidates', JSON.stringify(candidates.map((c) => ({ id: c.id, q: c.q }))));
     fd.append('ocr', ocrText || '');
     const res = await fetch(apiUrl('verify'), { method: 'POST', body: fd, signal, headers: { 'x-app-token': C.appToken } });
@@ -419,7 +419,8 @@
           const tr = M.rank(index, v.photo_question, 3);
           transcriptionOk = !!tr.length && tr[0].id === hit.id && tr[0].score >= C.verify.transcriptionMinScore;
         }
-        const debug = m.text + (v.photo_question ? '\n--- verifier read ---\n' + v.photo_question : '') + (v.reason ? '\n--- ' + v.reason : '');
+        const debug = m.text + (v.photo_question ? '\n--- verifier read ---\n' + v.photo_question : '') + (v.reason ? '\n--- ' + v.reason : '') +
+          (v.usage ? `\n--- ${v.model || ''} tokens in ${v.usage.input_tokens} out ${v.usage.output_tokens}${v.cost_usd != null ? ' ≈ $' + v.cost_usd : ''}` : '');
         // the same question with a different answer in another subject can never be green
         const clash = hit && M.hasConflictingTwin(hit, m.list);
         if (hit && v.confidence === 'high' && inTop3 && transcriptionOk && !clash) {

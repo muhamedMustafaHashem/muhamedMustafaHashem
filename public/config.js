@@ -6,9 +6,11 @@ window.APP_CONFIG = {
   // It only stops casual abuse; the real secrets stay in the Worker.
   appToken: 'change-me',
   // Cloud OCR timeout before we stop waiting and go to the verifier.
-  cloudOcrTimeoutMs: 4000,
+  cloudOcrTimeoutMs: 6000,
   verifyTimeoutMs: 12000,
-  // Accuracy first: a green answer always needs the photo verifier (Claude) to agree.
+  // The verifier gets a copy of the photo with this longest side (pixels); the model's price depends on image size.
+  verifyImageSide: 1280,
+  // Accuracy first: a green answer always needs the photo verifier (Gemini) to agree.
   verify: {
     // the verifier's own transcription of the photo must rank the chosen question first with this score
     requireTranscription: true,
